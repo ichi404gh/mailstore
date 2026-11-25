@@ -9,7 +9,8 @@ defmodule Mailstore.Imap.Search do
   SENTBEFORE/SENTON/SENTSINCE use the internal date as an approximation.
   """
   alias Mailstore.Core.Headers
-  alias Mailstore.Imap.{Format, SequenceSet, UidMap}
+  alias Mailstore.Core.UidMap
+  alias Mailstore.Imap.{Format, SequenceSet}
 
   @flag_keys %{
     "ANSWERED" => {"\\Answered", true},

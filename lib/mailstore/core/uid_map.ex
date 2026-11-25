@@ -1,8 +1,14 @@
-defmodule Mailstore.Imap.UidMap do
+defmodule Mailstore.Core.UidMap do
   @moduledoc """
-  A session's view of the selected folder: message sequence number N is the N-th UID
-  in ascending order. Every session has its own view; it changes only where IMAP lets
-  the server report EXISTS / EXPUNGE to that session.
+  A compact set of UIDs that also numbers them: sequence number N is the N-th UID in
+  ascending order.
+
+  Two users:
+
+    * an IMAP session's view of the selected folder. Every session has its own view;
+      it changes only where IMAP lets the server report EXISTS / EXPUNGE to it;
+    * the account actor's in-memory state of a folder (all UIDs, unseen UIDs), so
+      SELECT and SEARCH UNSEEN need no database (`Mailstore.Mailbox.AccountServer`).
 
   Two representations, whichever is smaller:
 
@@ -143,6 +149,27 @@ defmodule Mailstore.Imap.UidMap do
       [] -> map
       new -> from_ranges(ranges(map) ++ to_ranges(new))
     end
+  end
+
+  @doc """
+  Add UIDs anywhere (a message that lost \\Seen goes back into the unseen set).
+  Already-present ones are ignored. For new mail at the end, `append/2` is cheaper.
+  """
+  def put(map, uids) do
+    case uids |> Enum.reject(&seq(map, &1)) |> Enum.sort() |> Enum.dedup() do
+      [] -> map
+      new -> from_ranges(merge_sorted(ranges(map), to_ranges(new), []))
+    end
+  end
+
+  # Merge two ascending, non-overlapping run lists; adjacent runs are joined by from_ranges.
+  defp merge_sorted([], b, acc), do: Enum.reverse(acc, b)
+  defp merge_sorted(a, [], acc), do: Enum.reverse(acc, a)
+
+  defp merge_sorted([{a1, _} = ra | rest_a], [{b1, _} = rb | rest_b], acc) do
+    if a1 < b1,
+      do: merge_sorted(rest_a, [rb | rest_b], [ra | acc]),
+      else: merge_sorted([ra | rest_a], rest_b, [rb | acc])
   end
 
   @doc """

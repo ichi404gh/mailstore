@@ -4,7 +4,7 @@ defmodule Mailstore.Imap.SequenceSet do
   `*` is the largest number in use. `n:*` with n beyond the largest still matches the
   largest message (RFC 3501), which pollers that ask for `UIDNEXT:*` rely on.
   """
-  alias Mailstore.Imap.UidMap
+  alias Mailstore.Core.UidMap
 
   @type range :: {pos_integer | :star, pos_integer | :star}
 

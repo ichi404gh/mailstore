@@ -21,8 +21,8 @@ defmodule Mailstore.Imap.Session do
   require Logger
 
   alias Mailstore.{Directory, Mailbox}
-  alias Mailstore.Core.{Flags, NewMessage}
-  alias Mailstore.Imap.{Fetch, Format, Parser, Search, SequenceSet, UidMap}
+  alias Mailstore.Core.{Flags, NewMessage, UidMap}
+  alias Mailstore.Imap.{Fetch, Format, Parser, Search, SequenceSet}
 
   @capabilities "IMAP4rev1 LITERAL+ IDLE UIDPLUS MOVE NAMESPACE ID ENABLE UNSELECT SPECIAL-USE CHILDREN"
   @system_flags "(\\Answered \\Flagged \\Deleted \\Seen \\Draft)"
@@ -303,12 +303,12 @@ defmodule Mailstore.Imap.Session do
 
     case Mailbox.subscribe(s.account.id, name) do
       {:ok, actor, view} ->
-        # Subscribe first, then load: anything that lands in between arrives as a push and
-        # is ignored if already loaded.
-        map = UidMap.from_ranges(Mailbox.uid_ranges(s.account.tenant_id, view.id))
+        # The UIDs and first unseen come from the actor's memory, taken atomically with
+        # the subscription: no database query, and every later change arrives as a push.
+        map = view.uids
 
         unseen =
-          with uid when is_integer(uid) <- Mailbox.first_unseen_uid(s.account.tenant_id, view.id),
+          with uid when is_integer(uid) <- view.first_unseen,
                seq when is_integer(seq) <- UidMap.seq(map, uid) do
             ["* OK [UNSEEN ", Integer.to_string(seq), "] First unseen\r\n"]
           else
@@ -549,7 +549,7 @@ defmodule Mailstore.Imap.Session do
 
         :flags ->
           if Search.only_unseen?(tree) do
-            for uid <- Mailbox.unseen_uids(account.tenant_id, folder.id),
+            for uid <- unseen_uids(s),
                 seq = UidMap.seq(map, uid),
                 seq != nil,
                 do: %{uid: uid, seq: seq}
@@ -572,6 +572,14 @@ defmodule Mailstore.Imap.Session do
 
     numbers = Enum.map(hits, &if(uid?, do: &1.uid, else: &1.seq))
     ["* SEARCH", Enum.map(numbers, &[" ", Integer.to_string(&1)]), "\r\n"]
+  end
+
+  # From the actor's memory; the database only if the actor is unavailable.
+  defp unseen_uids(%{account: account, folder: folder}) do
+    case Mailbox.unseen(account.id, folder.name) do
+      {:ok, unseen} -> UidMap.to_list(unseen)
+      {:error, _} -> Mailbox.unseen_uids(account.tenant_id, folder.id)
+    end
   end
 
   # Keep only messages this session knows about, with their sequence numbers.
@@ -643,7 +651,7 @@ defmodule Mailstore.Imap.Session do
   @spec handle_actor_down(t) :: {iodata, t}
   def handle_actor_down(%{state: :selected} = s) do
     case Mailbox.subscribe(s.account.id, s.folder.name) do
-      {:ok, actor, _view} -> resync(%{s | actor: actor})
+      {:ok, actor, view} -> resync(%{s | actor: actor}, view.uids)
       {:error, _} -> {"* BYE Folder is unavailable\r\n", %{s | state: :logout}}
     end
   end
@@ -718,9 +726,11 @@ defmodule Mailstore.Imap.Session do
 
   defp apply_event({:reload, _view}, s), do: resync(s)
 
-  defp resync(s) do
+  # `current`: the folder's UIDs now, from a fresh subscription; nil reads them from the
+  # database (after retention, when the actor has dropped its state).
+  defp resync(s, current \\ nil) do
     %{account: account, folder: folder} = s
-    in_db = UidMap.from_ranges(Mailbox.uid_ranges(account.tenant_id, folder.id))
+    in_db = current || UidMap.from_ranges(Mailbox.uid_ranges(account.tenant_id, folder.id))
     known_max = UidMap.max_uid(s.map)
     # Rare path (actor restart, retention): walking the old map is acceptable here.
     gone = Enum.reject(UidMap.to_list(s.map), &UidMap.seq(in_db, &1))

@@ -54,12 +54,19 @@ defmodule Mailstore.Mailbox do
 
   ## Writes and live state (through the account actor)
 
-  @doc "Select a folder: {:ok, actor_pid, view}; deltas arrive as `{:mailstore, folder_id, event}`."
+  @doc """
+  Select a folder: {:ok, actor_pid, view}; deltas arrive as `{:mailstore, folder_id, event}`.
+  The view carries a snapshot from the actor's memory: `:uids` (`Mailstore.Core.UidMap`)
+  and `:first_unseen`.
+  """
   defdelegate subscribe(account_id, folder), to: AccountServer
   defdelegate unsubscribe(account_id), to: AccountServer
 
   @doc "SELECT/STATUS data from the actor's memory, no database round trip."
   defdelegate status(account_id, folder), to: AccountServer
+
+  @doc "SEARCH UNSEEN from the actor's memory: {:ok, UidMap of unseen UIDs}."
+  defdelegate unseen(account_id, folder), to: AccountServer
 
   @doc "Append `Mailstore.Core.NewMessage`s. Returns {:ok, uids}."
   defdelegate append(account_id, folder, msgs, opts \\ []), to: AccountServer

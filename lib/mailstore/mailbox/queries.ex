@@ -28,9 +28,16 @@ defmodule Mailstore.Mailbox.Queries do
   is constant within a run. A session's UID map is built from this, so SELECT moves one
   row per run instead of one row per message.
   """
-  def uid_ranges(folder_id) do
+  def uid_ranges(folder_id), do: ranges_of(messages_in(folder_id))
+
+  @doc "Runs of unseen UIDs, from the partial index `messages_folder_unseen`."
+  def unseen_uid_ranges(folder_id) do
+    ranges_of(from(m in messages_in(folder_id), where: fragment("(? & 1) = 0", m.flags)))
+  end
+
+  defp ranges_of(messages) do
     islands =
-      from m in messages_in(folder_id),
+      from m in messages,
         select: %{uid: m.uid, run: fragment("? - row_number() OVER (ORDER BY ?)", m.uid, m.uid)}
 
     from i in subquery(islands),

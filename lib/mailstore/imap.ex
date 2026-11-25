@@ -13,7 +13,7 @@ defmodule Mailstore.Imap do
 
   Internals: `Imap.Connection` (socket process), `Imap.Framing`, `Imap.Parser`,
   `Imap.Session` (state machine), `Imap.Fetch`, `Imap.Search`, `Imap.SequenceSet`,
-  `Imap.UidMap`, `Imap.Format`.
+  `Imap.Format`; the session's seq -> UID view is `Mailstore.Core.UidMap`.
   """
   use Supervisor
 

@@ -1,25 +1,41 @@
-defmodule Mailstore.Imap.UidMapTest do
+defmodule Mailstore.Core.UidMapTest do
   @moduledoc "Range-based UID map checked against a plain sorted list on random operations."
   use ExUnit.Case, async: true
-  alias Mailstore.Imap.{SequenceSet, UidMap}
+  alias Mailstore.Core.UidMap
+  alias Mailstore.Imap.SequenceSet
 
-  test "matches a plain list model under random appends and removals" do
+  test "matches a plain list model under random appends, insertions and removals" do
     :rand.seed(:exsss, {1, 2, 3})
 
     kinds =
       Enum.reduce(1..300, {UidMap.new([]), [], MapSet.new()}, fn _step, {map, model, kinds} ->
+        r = :rand.uniform()
+
         {map, model} =
-          if :rand.uniform() < 0.6 or model == [] do
-            # append a batch of new UIDs, sometimes with gaps
-            start = Enum.max([0 | model]) + :rand.uniform(3)
-            new = Enum.take_random(start..(start + 10), :rand.uniform(6))
-            {UidMap.append(map, new), Enum.sort(Enum.uniq(model ++ new))}
-          else
-            gone = Enum.take_random(model, :rand.uniform(min(4, length(model)))) ++ [999_999]
-            expected_seqs = for {uid, i} <- Enum.with_index(model, 1), uid in gone, do: i
-            {seqs, map} = UidMap.remove(map, gone)
-            assert seqs == Enum.reverse(expected_seqs)
-            {map, model -- gone}
+          cond do
+            r < 0.45 or model == [] ->
+              # append a batch of new UIDs, sometimes with gaps
+              start = Enum.max([0 | model]) + :rand.uniform(3)
+              # new mail is usually a contiguous batch; sometimes leave gaps
+              new =
+                if :rand.uniform() < 0.5,
+                  do: Enum.to_list(start..(start + :rand.uniform(6))),
+                  else: Enum.take_random(start..(start + 10), :rand.uniform(6))
+
+              {UidMap.append(map, new), Enum.sort(Enum.uniq(model ++ new))}
+
+            r < 0.65 ->
+              # put UIDs anywhere, some already present (like \\Seen being removed again)
+              holes = Enum.to_list(1..Enum.max(model)) -- model
+              new = Enum.take_random(holes ++ Enum.take_random(model, 2), :rand.uniform(5))
+              {UidMap.put(map, new), Enum.sort(Enum.uniq(model ++ new))}
+
+            true ->
+              gone = Enum.take_random(model, :rand.uniform(min(4, length(model)))) ++ [999_999]
+              expected_seqs = for {uid, i} <- Enum.with_index(model, 1), uid in gone, do: i
+              {seqs, map} = UidMap.remove(map, gone)
+              assert seqs == Enum.reverse(expected_seqs)
+              {map, model -- gone}
           end
 
         assert UidMap.to_list(map) == model

@@ -62,7 +62,7 @@ flowchart LR
 
 ## 2. Дерево процессов BEAM-ноды
 
-На каждое активное соединение — процесс `Imap.Connection`, на каждый активный аккаунт — один актор `AccountServer`, сколько бы сессий его ни открыло. Актор живёт, пока есть подписчики, и ещё `account_idle_timeout` после них.
+На каждое активное соединение — процесс `Imap.Connection`, на каждый активный аккаунт — один актор `AccountServer`, сколько бы сессий его ни открыло. Актор живёт, пока есть подписчики, и ещё `account_idle_timeout` после них. Для открытых папок он держит в памяти все UID и непрочитанные (диапазонами, `Core.UidMap`) и обновляет их на каждой своей записи, поэтому SELECT и UNSEEN не ходят в базу.
 
 ```mermaid
 flowchart TB
@@ -166,7 +166,7 @@ sequenceDiagram
 
 ## 5. IMAP-сессия
 
-Типичный клиент: подключение через HAProxy, LOGIN, SELECT, затем IDLE или периодический опрос. Горячие команды отвечаются без БД: LOGIN из кеша логинов, STATUS из памяти актора, `UID SEARCH UID n:*` из таблицы UID сессии.
+Типичный клиент: подключение через HAProxy, LOGIN, SELECT, затем IDLE или периодический опрос. Горячие команды отвечаются без БД: LOGIN из кеша логинов, STATUS, SELECT и `UID SEARCH UNSEEN` из памяти актора, `UID SEARCH UID n:*` из таблицы UID сессии.
 
 ```mermaid
 sequenceDiagram
@@ -191,12 +191,18 @@ sequenceDiagram
   C-->>Cl: a1 OK
   Cl->>C: a2 SELECT INBOX
   C->>A: subscribe(INBOX)
-  A-->>C: состояние папки (uidnext, счётчики)
-  C->>PG: uid_ranges (gaps and islands), first_unseen_uid
-  PG-->>C: диапазоны UID → UidMap
+  opt папка ещё не в памяти актора (первый SELECT за жизнь актора)
+    A->>PG: uid_ranges, unseen_uid_ranges (gaps and islands)
+    PG-->>A: диапазоны UID → UidMap
+  end
+  A-->>C: состояние папки и снимок: UidMap всех UID, первый непрочитанный
   C-->>Cl: * EXISTS, UIDVALIDITY, UIDNEXT, UNSEEN<br/>a2 OK [READ-WRITE]
   Cl->>C: a3 UID SEARCH UID 101:*
-  C-->>Cl: * SEARCH 101 102<br/>(из UidMap, без БД)
+  C-->>Cl: * SEARCH 101 102<br/>(из UidMap сессии, без БД)
+  Cl->>C: a3b UID SEARCH UNSEEN
+  C->>A: unseen(INBOX)
+  A-->>C: UidMap непрочитанных
+  C-->>Cl: * SEARCH 102<br/>(из памяти актора, без БД)
   Cl->>C: a4 IDLE
   C-->>Cl: + idling
   A--)C: {:exists, [103]}

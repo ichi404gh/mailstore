@@ -9,10 +9,20 @@ defmodule Mailstore.Mailbox.AccountServer do
     activity, then stops with `:normal`. Nothing to save: the database is the truth.
   * Serializes writes for the account and pushes deltas to the sessions that have the
     affected folder selected. Reads (FETCH, SEARCH) go straight to the shard (`Mailstore.Mailbox` read functions).
+  * Keeps the state of the folders sessions open: all UIDs and unseen UIDs, as
+    `Mailstore.Core.UidMap` runs (a 2 000-message folder without holes is ~200 bytes).
+    Loaded on the first subscribe, kept current by its own writes, dropped on COPY/MOVE
+    into the folder and on `reload_all/0`. SELECT and SEARCH UNSEEN read it instead of
+    the database.
 
   Prototype: placement is a local Registry. In a cluster the owner node comes from
   consistent hashing of `account_id` and callers reach it via `:erpc`. Correctness
   does not depend on there being exactly one actor; see `Mailstore.Mailbox.Commands`.
+
+  `subscribe/2` returns the folder view plus a snapshot taken atomically with the
+  subscription: `:uids` (a `UidMap`) and `:first_unseen` (UID or nil). Every change
+  after it arrives as a push, so the session needs no database query and has no window
+  in which a change could be missed.
 
   Subscriber messages: `{:mailstore, folder_id, event}` where event is one of
   `{:exists, uids, view}`, `{:flags, changes, modseq}`, `{:expunge, uids, modseq}`,
@@ -23,7 +33,7 @@ defmodule Mailstore.Mailbox.AccountServer do
   require Logger
 
   alias Mailstore.{Directory, Shards}
-  alias Mailstore.Core.Flags
+  alias Mailstore.Core.{Flags, UidMap}
   alias Mailstore.Mailbox.{Commands, Queries}
 
   @registry Mailstore.Mailbox.Registry
@@ -69,6 +79,9 @@ defmodule Mailstore.Mailbox.AccountServer do
 
   @doc "SELECT/STATUS data from memory: no database round trip."
   def status(account_id, folder), do: call(account_id, {:status, folder})
+
+  @doc "SEARCH UNSEEN from memory: {:ok, UidMap of unseen UIDs}."
+  def unseen(account_id, folder), do: call(account_id, {:unseen, folder})
 
   @doc "Append `Mailstore.Core.NewMessage`s. Returns {:ok, uids}."
   def append(account_id, folder, msgs, opts \\ []),
@@ -124,6 +137,7 @@ defmodule Mailstore.Mailbox.AccountServer do
           tenant_id: account.tenant_id,
           repo: repo,
           folders: load_folders(repo, account_id),
+          cache: %{},
           subs: %{},
           idle_timeout: Application.get_env(:mailstore, :account_idle_timeout, :timer.minutes(10))
         }
@@ -134,11 +148,22 @@ defmodule Mailstore.Mailbox.AccountServer do
 
   @impl true
   def handle_call({:subscribe, name, pid}, _from, st) do
-    with {:ok, f} <- folder(st, name) do
+    with {:ok, f} <- folder(st, name),
+         {:ok, cached, st} <- cached(st, f) do
       st = drop_sub(st, pid)
       ref = Process.monitor(pid)
       st = put_in(st.subs[pid], {f.id, ref})
-      reply({:ok, self(), f}, st)
+      view = Map.merge(f, %{uids: cached.uids, first_unseen: UidMap.uid(cached.unseen, 1)})
+      reply({:ok, self(), view}, st)
+    else
+      error -> reply(error, st)
+    end
+  end
+
+  def handle_call({:unseen, name}, _from, st) do
+    with {:ok, f} <- folder(st, name),
+         {:ok, cached, st} <- cached(st, f) do
+      reply({:ok, cached.unseen}, st)
     else
       error -> reply(error, st)
     end
@@ -152,7 +177,15 @@ defmodule Mailstore.Mailbox.AccountServer do
     with {:ok, f} <- folder(st, name),
          {:ok, {uids, counters}} <-
            tx(st, fn -> Commands.append(st.repo, f.id, st.tenant_id, msgs, opts) end) do
-      st = put_counters(st, name, counters)
+      unseen = for {m, uid} <- Enum.zip(msgs, uids), not Flags.seen?(m.flags_mask), do: uid
+
+      st =
+        st
+        |> put_counters(name, counters)
+        |> update_cache(f.id, fn c ->
+          %{c | uids: UidMap.append(c.uids, uids), unseen: UidMap.append(c.unseen, unseen)}
+        end)
+
       notify(st, f.id, {:exists, uids, st.folders[norm(name)]})
       reply({:ok, uids}, st)
     else
@@ -166,7 +199,15 @@ defmodule Mailstore.Mailbox.AccountServer do
     with {:ok, f} <- folder(st, name),
          {:ok, {changes, modseq, counters}} <-
            tx(st, fn -> Commands.store_flags(st.repo, f.id, uids, op, mask, kws) end) do
-      st = put_counters(st, name, counters)
+      {seen, unseen} = Enum.split_with(changes, &Flags.seen?(&1.mask))
+
+      st =
+        st
+        |> put_counters(name, counters)
+        |> update_cache(f.id, fn c ->
+          {_, without_seen} = UidMap.remove(c.unseen, Enum.map(seen, & &1.uid))
+          %{c | unseen: UidMap.put(without_seen, Enum.map(unseen, & &1.uid))}
+        end)
 
       changes =
         Enum.map(
@@ -185,7 +226,7 @@ defmodule Mailstore.Mailbox.AccountServer do
     with {:ok, f} <- folder(st, name),
          {:ok, {expunged, modseq, counters}} <-
            tx(st, fn -> Commands.expunge(st.repo, f.id, uids) end) do
-      st = put_counters(st, name, counters)
+      st = st |> put_counters(name, counters) |> forget_uids(f.id, expunged)
       if expunged != [], do: notify(st, f.id, {:expunge, expunged, modseq})
       reply({:ok, expunged}, st)
     else
@@ -198,7 +239,8 @@ defmodule Mailstore.Mailbox.AccountServer do
          {:ok, dst} <- folder(st, to),
          {:ok, {mapping, counters}} <-
            tx(st, fn -> Commands.copy(st.repo, src.id, uids, dst.id) end) do
-      st = put_counters(st, to, counters)
+      # Copies keep their source flags, which the actor may not have: reload on next use.
+      st = st |> put_counters(to, counters) |> drop_cache(dst.id)
 
       if mapping != [],
         do: notify(st, dst.id, {:exists, Enum.map(mapping, &elem(&1, 1)), st.folders[norm(to)]})
@@ -229,7 +271,13 @@ defmodule Mailstore.Mailbox.AccountServer do
              {mapping, dst_counters, expunged, modseq, src_counters}
            end) do
       {mapping, dst_counters, expunged, modseq, src_counters} = result
-      st = st |> put_counters(to, dst_counters) |> put_counters(from, src_counters)
+
+      st =
+        st
+        |> put_counters(to, dst_counters)
+        |> put_counters(from, src_counters)
+        |> drop_cache(dst.id)
+        |> forget_uids(src.id, expunged)
 
       if mapping != [] do
         notify(st, dst.id, {:exists, Enum.map(mapping, &elem(&1, 1)), st.folders[norm(to)]})
@@ -244,7 +292,7 @@ defmodule Mailstore.Mailbox.AccountServer do
 
   @impl true
   def handle_cast(:reload, st) do
-    st = %{st | folders: load_folders(st.repo, st.account_id)}
+    st = %{st | folders: load_folders(st.repo, st.account_id), cache: %{}}
 
     for {pid, {fid, _ref}} <- st.subs do
       case Enum.find(Map.values(st.folders), &(&1.id == fid)) do
@@ -277,6 +325,45 @@ defmodule Mailstore.Mailbox.AccountServer do
       Logger.error("account #{st.account_id}: #{Exception.message(e)}")
       {:error, e}
   end
+
+  # Folder state for SELECT / SEARCH UNSEEN, loaded once and then kept current.
+  defp cached(st, %{id: fid}) do
+    case st.cache do
+      %{^fid => cached} ->
+        {:ok, cached, st}
+
+      _ ->
+        cached = %{
+          uids: UidMap.from_ranges(st.repo.all(Queries.uid_ranges(fid))),
+          unseen: UidMap.from_ranges(st.repo.all(Queries.unseen_uid_ranges(fid)))
+        }
+
+        {:ok, cached, put_in(st.cache[fid], cached)}
+    end
+  rescue
+    e in [Postgrex.Error, DBConnection.ConnectionError] ->
+      Logger.error("account #{st.account_id}: #{Exception.message(e)}")
+      {:error, e}
+  end
+
+  defp update_cache(st, folder_id, fun) do
+    case st.cache do
+      %{^folder_id => cached} -> put_in(st.cache[folder_id], fun.(cached))
+      _ -> st
+    end
+  end
+
+  defp forget_uids(st, _folder_id, []), do: st
+
+  defp forget_uids(st, folder_id, uids) do
+    update_cache(st, folder_id, fn c ->
+      {_, all} = UidMap.remove(c.uids, uids)
+      {_, unseen} = UidMap.remove(c.unseen, uids)
+      %{c | uids: all, unseen: unseen}
+    end)
+  end
+
+  defp drop_cache(st, folder_id), do: %{st | cache: Map.delete(st.cache, folder_id)}
 
   defp load_folders(repo, account_id) do
     repo.all(Queries.folders_of_account(account_id))

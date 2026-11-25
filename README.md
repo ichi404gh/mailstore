@@ -16,7 +16,8 @@
 - **IMAP4rev1-сервер.**
   - Команды: LOGIN, LIST, STATUS, SELECT/EXAMINE, APPEND, FETCH, STORE, SEARCH, COPY/MOVE, EXPUNGE, IDLE (и UID-варианты), UIDPLUS.
   - Уведомления об изменениях только там, где их разрешает протокол.
-  - Быстрый SEARCH: по UID — без БД, UNSEEN — по индексу.
+  - Быстрый SEARCH: по UID — без БД, UNSEEN — из памяти актора.
+  - SELECT и UNSEEN из памяти актора: состояние открытых папок держит актор аккаунта, Postgres в этих командах не участвует (SELECT 220 + 140 → 99 мкс, UNSEEN 120 + 80 → 92 мкс, см. [bench/README.md](bench/README.md#select-и-unseen-из-памяти-актора)).
   - Таблица UID сессии хранится диапазонами.
   - MIME и BODYSTRUCTURE: дерево частей со смещениями разбирается при доставке, BODY/BODYSTRUCTURE отдаются без чтения тела, `BODY[1.2]`, `BODY[2.MIME]`, `BODY[3.HEADER]` режут сырые байты по смещениям.
 - **TLS через HAProxy** (`deploy/haproxy`) и PROXY protocol v2 (сервер видит настоящий IP клиента), сертификат ECDSA.
@@ -39,12 +40,12 @@
   | Справочник на ~860 тыс. аккаунтов | ~530 MB на ноду, поиск ~6,5 мкс |
 
 - **Сравнение со Stalwart** v1.2.0 на тех же сценариях (стенд `bench/stalwart`, итоги в [bench/README.md](bench/README.md#сравнение-со-stalwart)):
-  - Stalwart быстрее на командах: NOOP 30 против 75 мкс, SELECT и UNSEEN ~30 мкс и без Postgres против 220 + 140 мкс (он держит состояние папок в памяти);
+  - Stalwart быстрее на командах: NOOP 30 против 75 мкс, SELECT и UNSEEN ~30 мкс и без Postgres против наших 220 + 140 мкс (он держит состояние папок в памяти; после переноса этого приёма у нас 99 мкс без Postgres);
   - память на простаивающую сессию 2,5 против 12,9 KB RSS;
   - доставка стоит одинаково, ~1,6 мс CPU на письмо (сервер плюс Postgres);
   - кеша логинов у Stalwart нет, но с хешами SHA512-CRYPT из Dovecot вход стоит 1,2 мс;
   - модель хранения не подходит без доработок: все ноды на одном хранилище данных, шардирования данных по tenant нет ни в одной редакции, удаление по сроку — только Trash и Junk, приёма из Kafka нет.
-- 75 тестов, включая сквозной через Python imaplib.
+- 78 тестов, включая сквозной через Python imaplib.
 
 ### Решения
 
@@ -67,7 +68,7 @@
 4. **Консьюмер очереди входящих** (Broadway); group commit в акторе.
 5. **Протокол и совместимость:** CONDSTORE/QRESYNC, CREATE/RENAME/DELETE папок; Dovecot `imaptest`; Thunderbird, Apple Mail.
 6. **Нагрузка на Linux:** 100 тыс. сессий, CPU и задержка TLS-рукопожатий, сценарий burst, память TLS в BEAM против HAProxy.
-7. **SELECT и UNSEEN из памяти актора:** у Stalwart так и сделано, и эти команды у него в 4–8 раз дешевле и не нагружают Postgres.
+7. **Цена раунда команды:** NOOP стоит 75 мкс CPU против 30 у Stalwart.
 
 ### Открытые вопросы
 
@@ -79,7 +80,7 @@
 
 ```bash
 docker compose up -d postgres            # Postgres 17 на :55432
-mix test                                 # 75 тестов
+mix test                                 # 78 тестов
 deploy/haproxy/gen-cert.sh && docker compose up -d haproxy   # если нужен TLS на :10993
 ```
 
@@ -90,7 +91,7 @@ deploy/haproxy/gen-cert.sh && docker compose up -d haproxy   # если нуже
 ```bash
 docker compose up -d          # Postgres 17 на localhost:55432
 mix setup                     # deps + создание БД + миграции
-mix test                      # 75 тестов, включая сквозной через Python imaplib
+mix test                      # 78 тестов, включая сквозной через Python imaplib
 mix run priv/scripts/bench_delivery.exs -- --accounts 2000 --messages 50000 --concurrency 64
 mix run --no-halt             # IMAP на 127.0.0.1:1143 (без TLS: TLS снимается на HAProxy)
 ```
@@ -124,6 +125,7 @@ lib/mailstore/
 │   ├── new_message.ex         письмо, подготовленное к записи (разобрано один раз)
 │   ├── flags.ex               флаги IMAP ↔ битовая маска
 │   ├── message_class.ex       warmup / reply / bounce / ...
+│   ├── uid_map.ex             множество UID диапазонами с номерами: вид папки у сессии и у актора
 │   └── body_codec.ex          сжатие zstd
 │
 ├── directory.ex               КОНТЕКСТ: tenants, домены, аккаунты, правила пересылки
@@ -136,7 +138,7 @@ lib/mailstore/
 │   ├── schemas/               folder, message, message_body, vanished
 │   ├── queries.ex             чтение (Ecto-запросы)
 │   ├── commands.ex            запись (SQL: append, store_flags, expunge, copy)
-│   ├── account_server.ex      актор аккаунта
+│   ├── account_server.ex      актор аккаунта: запись, уведомления, состояние открытых папок в памяти
 │   ├── partitions.ex          недельные партиции и удаление по сроку хранения
 │   ├── partition_maintainer.ex
 │   └── supervisor.ex          дерево процессов контекста
@@ -151,7 +153,6 @@ lib/mailstore/
 │   ├── session.ex             машина состояний сессии, без сокетов
 │   ├── fetch.ex, search.ex    FETCH и SEARCH
 │   ├── sequence_set.ex        1:3,5,7:*
-│   ├── uid_map.ex             seq → UID этой сессии
 │   └── format.ex              строки, флаги, даты, ENVELOPE
 │
 ├── telemetry.ex               события :telemetry, статистика команд, снимок VM
@@ -168,9 +169,9 @@ bench/                         нагрузочные тесты, не вход�
 | Контекст | Публичный API | Внутреннее устройство |
 |---|---|---|
 | `Directory` | создание tenant / домена / аккаунта, `lookup_account`, `forwardings_for(account, class)` | `Schemas.*`, `Queries` |
-| `Mailbox` | запись: `append`, `store_flags`, `expunge`, `copy`, `move`, `subscribe`, `status` (через актор); чтение: `uids`, `fetch_meta`, `fetch_raw`, `changed_since`, `vanished_since` (напрямую из шарда); `drop_partitions_before` | `AccountServer`, `Commands`, `Queries`, `Schemas.*`, `Partitions` |
+| `Mailbox` | запись: `append`, `store_flags`, `expunge`, `copy`, `move`, `subscribe`, `status`, `unseen` (через актор); чтение: `uids`, `fetch_meta`, `fetch_raw`, `changed_since`, `vanished_since` (напрямую из шарда); `drop_partitions_before` | `AccountServer`, `Commands`, `Queries`, `Schemas.*`, `Partitions` |
 | `Delivery` | `deliver(raw, rcpt, class: ...)` | использует только API `Directory` и `Mailbox` |
-| `Imap` | listener (`child_spec`, `port`) | `Connection`, `Framing`, `Parser`, `Session`, `Fetch`, `Search`, `SequenceSet`, `UidMap`, `Format`; снаружи использует только `Directory.authenticate` и `Mailbox` |
+| `Imap` | listener (`child_spec`, `port`) | `Connection`, `Framing`, `Parser`, `Session`, `Fetch`, `Search`, `SequenceSet`, `Format`; снаружи использует только `Directory.authenticate` и `Mailbox` |
 
 Чтение и запись разведены специально. Чтение — это композируемые Ecto-запросы в `Queries`. Запись — явный SQL в `Commands`: там CTE и `FOR UPDATE`, которые на Ecto DSL читаются хуже.
 
@@ -183,14 +184,15 @@ bench/                         нагрузочные тесты, не вход�
 **Поддерживается** (по CAPABILITY): `IMAP4rev1 LITERAL+ IDLE UIDPLUS MOVE NAMESPACE ID ENABLE UNSELECT SPECIAL-USE CHILDREN`.
 
 - Сессия: CAPABILITY, NOOP, LOGOUT, ID, LOGIN.
-- Папки: LIST, LSUB, STATUS (из памяти актора), SELECT, EXAMINE, SUBSCRIBE/UNSUBSCRIBE (no-op), NAMESPACE.
+- Папки: LIST, LSUB, STATUS, SELECT и EXAMINE (все из памяти актора), SUBSCRIBE/UNSUBSCRIBE (no-op), NAMESPACE.
 - Письма: APPEND (APPENDUID), FETCH / UID FETCH, STORE / UID STORE (включая .SILENT), SEARCH / UID SEARCH, COPY / MOVE (COPYUID), EXPUNGE / UID EXPUNGE, CLOSE, UNSELECT, CHECK, IDLE.
 - FETCH: UID, FLAGS, INTERNALDATE, RFC822.SIZE, ENVELOPE, BODY, BODYSTRUCTURE, RFC822[.HEADER|.TEXT], макросы ALL/FAST/FULL, BODY[] и BODY.PEEK[] с секциями HEADER, TEXT, HEADER.FIELDS[.NOT], номерами частей (`1.2`), их MIME/HEADER/TEXT и частичной выдачей `<n.m>`. Чтение без PEEK ставит `\Seen` и сообщает новые флаги.
 - MIME (`Core.Mime`): дерево частей разбирается при доставке и хранится в `messages.bodystructure` (jsonb, короткие ключи: ~100 байт у text/plain, ~300 у multipart/alternative). Разбор стоит ~6 мкс на простое письмо и ~20 мкс на multipart/alternative. BODYSTRUCTURE отдаётся из метаданных одним запросом, секции частей режутся по смещениям из дерева. Формат ответа как у Dovecot: типы в нижнем регистре, параметры как в письме, продолжения RFC 2231 склеены. Защита от враждебных писем: глубина до 32, до 1 000 частей (остальные остаются внутри последней). Строки без дерева (записанные до парсера) получают его разбором тела при FETCH. Проверено сверкой с пакетом `email` из Python на 200 сгенерированных письмах (751 часть).
-- SEARCH: флаги, KEYWORD, FROM/TO/CC/BCC/SUBJECT, HEADER, BODY, TEXT, LARGER/SMALLER, BEFORE/ON/SINCE, UID, наборы номеров, NOT, OR, скобки, CHARSET. Запросы только по UID и номерам отвечаются без БД, UNSEEN — одним запросом по частичному индексу, флаги — узкими строками без envelope.
-- Таблица UID сессии (`Imap.UidMap`) хранит диапазоны подряд идущих UID и переходит на простой кортеж, если дыр слишком много: папка из 2 000 писем без удалений занимает ~200 байт.
+- SEARCH: флаги, KEYWORD, FROM/TO/CC/BCC/SUBJECT, HEADER, BODY, TEXT, LARGER/SMALLER, BEFORE/ON/SINCE, UID, наборы номеров, NOT, OR, скобки, CHARSET. Запросы только по UID и номерам отвечаются из таблицы UID сессии, UNSEEN — из памяти актора, оба без БД; остальные флаги — узкими строками без envelope.
+- Таблица UID (`Core.UidMap`) хранит диапазоны подряд идущих UID и переходит на простой кортеж, если дыр слишком много: папка из 2 000 писем без удалений занимает ~200 байт.
+- Состояние открытых папок в акторе аккаунта: все UID и непрочитанные, оба как `UidMap`. Загружается при первом SELECT за жизнь актора и дальше обновляется его же записями (APPEND, STORE, EXPUNGE), сбрасывается при COPY/MOVE в папку и после удаления по сроку. SELECT получает снимок вместе с подпиской, атомарно, поэтому окна, в котором можно пропустить изменение, нет.
 
-**Push-уведомления.** Изменения от актора (новые письма, флаги, удаления) превращаются в нетегированные ответы только там, где это разрешает протокол: в конце команды и сразу во время IDLE. Во время FETCH, STORE и SEARCH без UID EXPUNGE не отправляется, чтобы номера не съехали у клиента. Если актор упал, сессия переподписывается и догоняет состояние из БД.
+**Push-уведомления.** Изменения от актора (новые письма, флаги, удаления) превращаются в нетегированные ответы только там, где это разрешает протокол: в конце команды и сразу во время IDLE. Во время FETCH, STORE и SEARCH без UID EXPUNGE не отправляется, чтобы номера не съехали у клиента. Если актор упал, сессия переподписывается и догоняет состояние: UID берёт из снимка нового актора, изменения флагов — из БД по MODSEQ.
 
 **TLS.** Его снимает HAProxy (`deploy/haproxy`): неявный TLS на 993 по RFC 8314, кеш TLS-сессий для переподключений, сертификат ECDSA P-256. На BEAM передаётся открытый IMAP с заголовком PROXY protocol v2 на отдельный порт (`proxy_port`, 1144), так что сервер видит настоящий IP клиента. Соединение на этот порт без заголовка закрывается. STARTTLS на 143 нет: HAProxy не умеет его для IMAP, а клиенты ходят на 993.
 
@@ -262,8 +264,9 @@ BEAM на команду IMAP тратит больше CPU, чем C-серве
 - IMAP-протокол: framing с синхронными литералами и LITERAL+, разбор команд, наборы номеров (включая `n:*` за последним письмом), ENVELOPE, даты.
 - IMAP-сессия без сети: LOGIN, SELECT, FETCH (PEEK не меняет `\Seen`, BODY[] меняет), STORE, SEARCH, APPEND с литералом, COPY/MOVE с COPYUID, EXPUNGE с перенумерацией, read-only EXAMINE. Push: IDLE получает новое письмо сразу; чужой EXPUNGE откладывается во время FETCH и приходит после NOOP; при падении актора сессия догоняет состояние.
 - Сквозной тест по TCP настоящим клиентом, Python `imaplib` (`test/imaplib/client.py`): login, list, select, append, fetch, store, search, copy, move, expunge и IDLE, пока тест доставляет письмо через `Delivery`.
-- Быстрый SEARCH: по UID и номерам — ноль запросов в БД, UNSEEN — один; `EXISTS` уходит до результата поиска.
-- `UidMap` сверяется со списковой моделью на 300 случайных операциях (задействованы оба представления); память растёт с дырами, а не с письмами.
+- Быстрый SEARCH: по UID, номерам и UNSEEN — ноль запросов в БД, повторный SELECT тоже; `EXISTS` уходит до результата поиска.
+- Состояние папок в памяти актора совпадает с базой после 60 случайных записей (APPEND, STORE ±`\Seen`, EXPUNGE, MOVE); после удаления по сроку перечитывается.
+- `UidMap` сверяется со списковой моделью на 300 случайных операциях: добавление, вставка в середину, удаление (задействованы оба представления); память растёт с дырами, а не с письмами.
 - Кеш справочника: чтения без БД, изменения в обход `Directory` подхватываются опросом, смена пароля сбрасывает кеш логинов, жёстко удалённые строки исчезают при полной перезагрузке.
 - Порт для HAProxy: IP клиента берётся из заголовка PROXY, соединение без заголовка закрывается.
 - Telemetry: счётчики команд по статусам, снимок видит соединения и их память.

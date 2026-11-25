@@ -2,7 +2,8 @@ defmodule Mailstore.Imap.ProtocolTest do
   @moduledoc "Pure protocol pieces: framing, parsing, sequence sets, UID map, formatting."
   use ExUnit.Case, async: true
   alias Mailstore.Core.Address
-  alias Mailstore.Imap.{Fetch, Format, Framing, Parser, SequenceSet, UidMap}
+  alias Mailstore.Core.UidMap
+  alias Mailstore.Imap.{Fetch, Format, Framing, Parser, SequenceSet}
 
   describe "framing" do
     test "complete lines, partial lines, two commands in one read" do

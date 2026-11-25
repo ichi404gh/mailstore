@@ -197,8 +197,9 @@ defmodule Mailstore.Imap.SessionTest do
       :ok
     end
 
-    # Count Ecto queries issued by this process while running `fun`.
-    defp queries(fun) do
+    # Count Ecto queries issued while running `fun`: by this process, or with `:all` by
+    # any process (the account actor included).
+    defp queries(fun, scope \\ :self) do
       test_pid = self()
       ref = make_ref()
       id = {:count_queries, ref}
@@ -207,7 +208,7 @@ defmodule Mailstore.Imap.SessionTest do
         id,
         [:mailstore, :repo, :query],
         fn _e, _m, _meta, _ ->
-          if self() == test_pid, do: send(test_pid, {ref, :query})
+          if scope == :all or self() == test_pid, do: send(test_pid, {ref, :query})
         end,
         nil
       )
@@ -239,14 +240,35 @@ defmodule Mailstore.Imap.SessionTest do
       assert out =~ "* SEARCH 5\r\n" and n == 0
     end
 
-    test "UNSEEN uses one indexed query; flag searches skip envelopes" do
+    test "SELECT and UNSEEN come from the account actor's memory, without the database" do
+      # The first SELECT loads the folder state into the actor; later ones do not query.
+      selected()
+      {{out, s}, n} = queries(fn -> cmd(login(), "s2 SELECT INBOX") end, :all)
+      assert out =~ "* 5 EXISTS" and out =~ "[UNSEEN 1]" and n == 0
+
+      {_, s} = cmd(s, "a1 STORE 1,2 +FLAGS.SILENT (\\Seen)")
+      {{out, s}, n} = queries(fn -> cmd(s, "a2 UID SEARCH UNSEEN") end, :all)
+      assert out =~ "* SEARCH 3 4 5\r\n" and n == 0
+
+      # The actor keeps the state current through every write.
+      {_, s} = cmd(s, "a3 STORE 2 -FLAGS.SILENT (\\Seen)")
+      {_, s} = cmd(s, "a4 STORE 4 +FLAGS.SILENT (\\Deleted)")
+      {_, s} = cmd(s, "a5 EXPUNGE")
+      deliver(subject: "new")
+      {{out, s}, n} = queries(fn -> cmd(s, "a6 UID SEARCH UNSEEN") end, :all)
+      assert out =~ "* SEARCH 2 3 5 6\r\n" and n == 0
+
+      {out, _} = cmd(login(), "s3 SELECT INBOX")
+      assert out =~ "* 5 EXISTS" and out =~ "[UNSEEN 2]"
+      {out, _} = cmd(s, "a7 UID SEARCH UID 1:* SEEN")
+      assert out =~ "* SEARCH 1\r\n"
+    end
+
+    test "flag searches other than UNSEEN read narrow rows, not envelopes" do
       s = selected()
       {_, s} = cmd(s, "a1 STORE 1,2 +FLAGS.SILENT (\\Seen)")
 
-      {{out, s}, n} = queries(fn -> cmd(s, "a2 UID SEARCH UNSEEN") end)
-      assert out =~ "* SEARCH 3 4 5\r\n" and n == 1
-
-      {{out, _}, n} = queries(fn -> cmd(s, "a3 UID SEARCH UID 2:4 SEEN") end)
+      {{out, _}, n} = queries(fn -> cmd(s, "a2 UID SEARCH UID 2:4 SEEN") end)
       assert out =~ "* SEARCH 2\r\n" and n == 1
     end
 
