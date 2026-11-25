@@ -65,7 +65,8 @@ defmodule Mailstore.Mailbox.Commands do
            thread_id: m.thread_id,
            from_addr: m.from_addr,
            subject: m.subject,
-           envelope: m.envelope
+           envelope: m.envelope,
+           bodystructure: m.bodystructure
          }, %{folder_id: folder_id, uid: uid, stored_at: stored_at, codec: codec, data: data}}
       end)
       |> Enum.unzip()

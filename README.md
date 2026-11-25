@@ -18,6 +18,7 @@
   - Уведомления об изменениях только там, где их разрешает протокол.
   - Быстрый SEARCH: по UID — без БД, UNSEEN — по индексу.
   - Таблица UID сессии хранится диапазонами.
+  - MIME и BODYSTRUCTURE: дерево частей со смещениями разбирается при доставке, BODY/BODYSTRUCTURE отдаются без чтения тела, `BODY[1.2]`, `BODY[2.MIME]`, `BODY[3.HEADER]` режут сырые байты по смещениям.
 - **TLS через HAProxy** (`deploy/haproxy`) и PROXY protocol v2 (сервер видит настоящий IP клиента), сертификат ECDSA.
 - **Directory в ETS** и кеш успешных логинов.
 - **Telemetry**; нагрузочные инструменты в `bench/`: `seed.exs`, `seed_folders.exs`, генератор `loadgen` со сценариями idle и poller, ключами `--tls` и `--until`.
@@ -37,7 +38,7 @@
   | Доставка письма | ~0,5 мс CPU сервера + ~1 мс Postgres |
   | Справочник на ~860 тыс. аккаунтов | ~530 MB на ноду, поиск ~6,5 мкс |
 
-- 66 тестов, включая сквозной через Python imaplib.
+- 75 тестов, включая сквозной через Python imaplib.
 
 ### Решения
 
@@ -54,15 +55,14 @@
 
 ### Дальше, по приоритету
 
-1. **MIME и BODYSTRUCTURE:** разбор при доставке, хранение дерева частей и их смещений, FETCH `BODY[n.m]`.
-2. **Сравнение со Stalwart** на сценариях idle и poller: делать самим или брать готовое.
-3. **Профиль команд реальных клиентов** — чтобы собрать реалистичный сценарий poller.
-4. **Шарды в прототипе:** таблица `shards`, dynamic repos, перенос tenant, тест на двух шардах.
-5. **Холодный слой тел** (закрытые недели → объектное хранилище), классы хранения, словари zstd.
-6. **Консьюмер очереди входящих** (Broadway); group commit в акторе.
-7. **Протокол и совместимость:** CONDSTORE/QRESYNC, CREATE/RENAME/DELETE папок; Dovecot `imaptest`; Thunderbird, Apple Mail.
-8. **Нагрузка на Linux:** 100 тыс. сессий, CPU и задержка TLS-рукопожатий, сценарий burst, память TLS в BEAM против HAProxy.
-9. **SELECT и UNSEEN из памяти актора**, если профиль команд покажет, что они частые.
+1. **Сравнение со Stalwart** на сценариях idle и poller: делать самим или брать готовое.
+2. **Профиль команд реальных клиентов** — чтобы собрать реалистичный сценарий poller.
+3. **Шарды в прототипе:** таблица `shards`, dynamic repos, перенос tenant, тест на двух шардах.
+4. **Холодный слой тел** (закрытые недели → объектное хранилище), классы хранения, словари zstd.
+5. **Консьюмер очереди входящих** (Broadway); group commit в акторе.
+6. **Протокол и совместимость:** CONDSTORE/QRESYNC, CREATE/RENAME/DELETE папок; Dovecot `imaptest`; Thunderbird, Apple Mail.
+7. **Нагрузка на Linux:** 100 тыс. сессий, CPU и задержка TLS-рукопожатий, сценарий burst, память TLS в BEAM против HAProxy.
+8. **SELECT и UNSEEN из памяти актора**, если профиль команд покажет, что они частые.
 
 ### Открытые вопросы
 
@@ -73,7 +73,7 @@
 
 ```bash
 docker compose up -d postgres            # Postgres 17 на :55432
-mix test                                 # 66 тестов
+mix test                                 # 75 тестов
 deploy/haproxy/gen-cert.sh && docker compose up -d haproxy   # если нужен TLS на :10993
 ```
 
@@ -84,7 +84,7 @@ deploy/haproxy/gen-cert.sh && docker compose up -d haproxy   # если нуже
 ```bash
 docker compose up -d          # Postgres 17 на localhost:55432
 mix setup                     # deps + создание БД + миграции
-mix test                      # 66 тестов, включая сквозной через Python imaplib
+mix test                      # 75 тестов, включая сквозной через Python imaplib
 mix run priv/scripts/bench_delivery.exs -- --accounts 2000 --messages 50000 --concurrency 64
 mix run --no-halt             # IMAP на 127.0.0.1:1143 (без TLS: TLS снимается на HAProxy)
 ```
@@ -114,6 +114,7 @@ docker compose up -d haproxy  # TLS на localhost:10993 → BEAM :1144 (PROXY p
 lib/mailstore/
 ├── core/                      чистые функции: без БД и процессов
 │   ├── headers.ex             разбор заголовков RFC 5322
+│   ├── mime.ex                дерево MIME-частей со смещениями (BODYSTRUCTURE, BODY[n.m])
 │   ├── new_message.ex         письмо, подготовленное к записи (разобрано один раз)
 │   ├── flags.ex               флаги IMAP ↔ битовая маска
 │   ├── message_class.ex       warmup / reply / bounce / ...
@@ -178,7 +179,8 @@ bench/                         нагрузочные тесты, не вход�
 - Сессия: CAPABILITY, NOOP, LOGOUT, ID, LOGIN.
 - Папки: LIST, LSUB, STATUS (из памяти актора), SELECT, EXAMINE, SUBSCRIBE/UNSUBSCRIBE (no-op), NAMESPACE.
 - Письма: APPEND (APPENDUID), FETCH / UID FETCH, STORE / UID STORE (включая .SILENT), SEARCH / UID SEARCH, COPY / MOVE (COPYUID), EXPUNGE / UID EXPUNGE, CLOSE, UNSELECT, CHECK, IDLE.
-- FETCH: UID, FLAGS, INTERNALDATE, RFC822.SIZE, ENVELOPE, RFC822[.HEADER|.TEXT], BODY[] и BODY.PEEK[] с секциями HEADER, TEXT, HEADER.FIELDS[.NOT] и частичной выдачей `<n.m>`. Чтение без PEEK ставит `\Seen` и сообщает новые флаги.
+- FETCH: UID, FLAGS, INTERNALDATE, RFC822.SIZE, ENVELOPE, BODY, BODYSTRUCTURE, RFC822[.HEADER|.TEXT], макросы ALL/FAST/FULL, BODY[] и BODY.PEEK[] с секциями HEADER, TEXT, HEADER.FIELDS[.NOT], номерами частей (`1.2`), их MIME/HEADER/TEXT и частичной выдачей `<n.m>`. Чтение без PEEK ставит `\Seen` и сообщает новые флаги.
+- MIME (`Core.Mime`): дерево частей разбирается при доставке и хранится в `messages.bodystructure` (jsonb, короткие ключи: ~100 байт у text/plain, ~300 у multipart/alternative). Разбор стоит ~6 мкс на простое письмо и ~20 мкс на multipart/alternative. BODYSTRUCTURE отдаётся из метаданных одним запросом, секции частей режутся по смещениям из дерева. Формат ответа как у Dovecot: типы в нижнем регистре, параметры как в письме, продолжения RFC 2231 склеены. Защита от враждебных писем: глубина до 32, до 1 000 частей (остальные остаются внутри последней). Строки без дерева (записанные до парсера) получают его разбором тела при FETCH. Проверено сверкой с пакетом `email` из Python на 200 сгенерированных письмах (751 часть).
 - SEARCH: флаги, KEYWORD, FROM/TO/CC/BCC/SUBJECT, HEADER, BODY, TEXT, LARGER/SMALLER, BEFORE/ON/SINCE, UID, наборы номеров, NOT, OR, скобки, CHARSET. Запросы только по UID и номерам отвечаются без БД, UNSEEN — одним запросом по частичному индексу, флаги — узкими строками без envelope.
 - Таблица UID сессии (`Imap.UidMap`) хранит диапазоны подряд идущих UID и переходит на простой кортеж, если дыр слишком много: папка из 2 000 писем без удалений занимает ~200 байт.
 
@@ -188,7 +190,7 @@ bench/                         нагрузочные тесты, не вход�
 
 **Directory в ETS** (`Directory.Cache`). Поиск получателя, LOGIN и правила маршрутизации идут без базы. Изменённые строки опрашиваются раз в секунду, полная перезагрузка раз в 10 минут убирает удалённые. Записи через `Directory` применяются сразу. Успешные логины кешируются на час как HMAC от хеша пароля и самого пароля; смена пароля их сбрасывает. На ~860 тыс. аккаунтов: ~530 MB на ноду, поиск ~6,5 мкс, полная загрузка 5–9 с.
 
-**Пока нет:** BODYSTRUCTURE / BODY / FULL и секции MIME-частей (нужен MIME-парсер), CREATE / DELETE / RENAME папок, AUTHENTICATE, CONDSTORE / QRESYNC в протоколе (в хранилище MODSEQ уже есть), имена папок в modified UTF-7.
+**Пока нет:** BINARY (RFC 3516, декодирование base64/QP на сервере), поиск BODY/TEXT по декодированному тексту частей (сейчас — по сырым байтам), CREATE / DELETE / RENAME папок, AUTHENTICATE, CONDSTORE / QRESYNC в протоколе (в хранилище MODSEQ уже есть), имена папок в modified UTF-7.
 
 ## Наблюдаемость и нагрузка
 

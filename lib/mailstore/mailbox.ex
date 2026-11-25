@@ -98,10 +98,13 @@ defmodule Mailstore.Mailbox do
     |> Enum.map(fn m -> Map.put(m, :flags, Flags.to_list(m.flags, m.keywords)) end)
   end
 
-  @doc "FETCH FLAGS/INTERNALDATE/RFC822.SIZE/ENVELOPE without touching bodies."
-  def fetch_meta(tenant_id, folder_id, uids) do
+  @doc """
+  FETCH FLAGS/INTERNALDATE/RFC822.SIZE/ENVELOPE without touching bodies. With
+  `structure?` the rows also carry `:bodystructure`, the MIME tree (`Mailstore.Core.Mime`).
+  """
+  def fetch_meta(tenant_id, folder_id, uids, structure? \\ false) do
     tenant_id
-    |> run(:all, Queries.meta(folder_id, uids))
+    |> run(:all, Queries.meta(folder_id, uids, structure?))
     |> Enum.map(fn m -> Map.put(m, :flags, Flags.to_list(m.flags, m.keywords)) end)
   end
 

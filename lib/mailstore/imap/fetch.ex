@@ -2,20 +2,30 @@ defmodule Mailstore.Imap.Fetch do
   @moduledoc """
   FETCH data items: parsing the request and rendering responses.
 
-  Supported: UID, FLAGS, INTERNALDATE, RFC822.SIZE, ENVELOPE, RFC822, RFC822.HEADER,
-  RFC822.TEXT, BODY[]/BODY.PEEK[] with sections "", HEADER, TEXT,
-  HEADER.FIELDS (...), HEADER.FIELDS.NOT (...), and partial <start.len>; macros ALL and
-  FAST. Not yet: BODYSTRUCTURE / BODY / FULL and MIME part sections (need a MIME parser).
+  Supported: UID, FLAGS, INTERNALDATE, RFC822.SIZE, ENVELOPE, BODY, BODYSTRUCTURE,
+  RFC822, RFC822.HEADER, RFC822.TEXT, macros ALL, FAST and FULL, and
+  BODY[]/BODY.PEEK[] with any section: "", HEADER, TEXT, HEADER.FIELDS (...),
+  HEADER.FIELDS.NOT (...), part paths (1.2), their MIME/HEADER/TEXT, and partial
+  <start.len>.
+
+  BODY and BODYSTRUCTURE come from the MIME tree stored at delivery
+  (`Mailstore.Core.Mime`), without reading the body. Part sections slice the raw
+  message by the offsets in that tree.
   """
+  alias Mailstore.Core.Mime
   alias Mailstore.Imap.Format
 
-  @type section :: :full | :header | :text | {:fields, [binary]} | {:fields_not, [binary]}
+  @type kind ::
+          :full | :header | :text | :mime | {:fields, [binary]} | {:fields_not, [binary]}
+  @type section :: {path :: [pos_integer], kind}
   @type item ::
           :uid
           | :flags
           | :internaldate
           | :size
           | :envelope
+          | :body_structure
+          | :bodystructure
           | {:body, peek :: boolean, section, partial :: nil | {non_neg_integer, pos_integer},
              name :: binary}
 
@@ -46,12 +56,14 @@ defmodule Mailstore.Imap.Fetch do
       "INTERNALDATE" -> {:ok, [:internaldate]}
       "RFC822.SIZE" -> {:ok, [:size]}
       "ENVELOPE" -> {:ok, [:envelope]}
+      "BODY" -> {:ok, [:body_structure]}
+      "BODYSTRUCTURE" -> {:ok, [:bodystructure]}
       "FAST" -> {:ok, [:flags, :internaldate, :size]}
       "ALL" -> {:ok, [:flags, :internaldate, :size, :envelope]}
-      "RFC822" -> {:ok, [{:body, false, :full, nil, "RFC822"}]}
-      "RFC822.HEADER" -> {:ok, [{:body, true, :header, nil, "RFC822.HEADER"}]}
-      "RFC822.TEXT" -> {:ok, [{:body, false, :text, nil, "RFC822.TEXT"}]}
-      x when x in ["BODY", "BODYSTRUCTURE", "FULL"] -> {:error, "#{x} is not implemented yet"}
+      "FULL" -> {:ok, [:flags, :internaldate, :size, :envelope, :body_structure]}
+      "RFC822" -> {:ok, [{:body, false, {[], :full}, nil, "RFC822"}]}
+      "RFC822.HEADER" -> {:ok, [{:body, true, {[], :header}, nil, "RFC822.HEADER"}]}
+      "RFC822.TEXT" -> {:ok, [{:body, false, {[], :text}, nil, "RFC822.TEXT"}]}
       _ -> body_item(a)
     end
   end
@@ -79,10 +91,35 @@ defmodule Mailstore.Imap.Fetch do
     end
   end
 
+  # "1.2.HEADER.FIELDS (FROM)" -> {[1, 2], {:fields, ["from"]}}
   defp section(spec) do
     up = String.upcase(String.trim(spec))
 
-    case Regex.run(~r/^HEADER\.FIELDS(\.NOT)?\s*\((.*)\)$/s, up) do
+    {nums, rest} =
+      case Regex.run(~r/^(\d+(?:\.\d+)*)(?:\.(.+))?$/s, up) do
+        [_, nums] -> {nums, ""}
+        [_, nums, rest] -> {nums, rest}
+        nil -> {nil, up}
+      end
+
+    path = if nums, do: nums |> String.split(".") |> Enum.map(&String.to_integer/1), else: []
+
+    with true <- 0 not in path || {:error, "Invalid section #{spec}"},
+         {:ok, kind, kind_label} <- kind(rest, path) do
+      label =
+        [Enum.join(path, "."), kind_label]
+        |> Enum.reject(&(&1 == ""))
+        |> Enum.join(".")
+
+      {:ok, {path, kind}, label}
+    else
+      {:error, _} = e -> e
+      :error -> {:error, "Invalid section #{spec}"}
+    end
+  end
+
+  defp kind(rest, path) do
+    case Regex.run(~r/^HEADER\.FIELDS(\.NOT)?\s*\((.*)\)$/s, rest) do
       [_, not_, names] ->
         names = names |> String.split() |> Enum.map(&String.trim(&1, ~s(")))
         kind = if not_ == "", do: :fields, else: :fields_not
@@ -91,11 +128,12 @@ defmodule Mailstore.Imap.Fetch do
          "HEADER.FIELDS#{not_} (#{Enum.join(names, " ")})"}
 
       nil ->
-        case up do
+        case rest do
           "" -> {:ok, :full, ""}
           "HEADER" -> {:ok, :header, "HEADER"}
           "TEXT" -> {:ok, :text, "TEXT"}
-          _ -> {:error, "Section #{spec} is not implemented yet"}
+          "MIME" when path != [] -> {:ok, :mime, "MIME"}
+          _ -> :error
         end
     end
   end
@@ -103,8 +141,22 @@ defmodule Mailstore.Imap.Fetch do
   def needs_body?(items), do: Enum.any?(items, &match?({:body, _, _, _, _}, &1))
   def sets_seen?(items), do: Enum.any?(items, &match?({:body, false, _, _, _}, &1))
 
-  @doc "One `* n FETCH (...)` line. `msg` is a `Mailbox.fetch_meta/3` row, `raw` the bytes or nil."
+  @doc "BODY/BODYSTRUCTURE or a part section: the rows must carry the MIME tree."
+  def needs_structure?(items) do
+    Enum.any?(items, fn
+      i when i in [:body_structure, :bodystructure] -> true
+      {:body, _, {[_ | _], _}, _, _} -> true
+      _ -> false
+    end)
+  end
+
+  @doc """
+  One `* n FETCH (...)` line. `msg` is a `Mailbox.fetch_meta/4` row, `raw` the bytes or
+  nil. A row without a stored MIME tree gets one parsed from `raw`.
+  """
   def render(seq, items, msg, raw) do
+    tree = Map.get(msg, :bodystructure) || (raw && needs_structure?(items) && Mime.parse(raw))
+
     parts =
       items
       |> Enum.map(fn
@@ -123,13 +175,50 @@ defmodule Mailstore.Imap.Fetch do
         :envelope ->
           ["ENVELOPE ", Format.envelope(msg.envelope)]
 
+        :body_structure ->
+          ["BODY ", Format.body_structure(tree, false)]
+
+        :bodystructure ->
+          ["BODYSTRUCTURE ", Format.body_structure(tree, true)]
+
         {:body, _peek, section, partial, name} ->
-          [name, " ", Format.literal(slice(extract(raw || "", section), partial))]
+          case extract(raw || "", tree, section) do
+            nil -> [name, " NIL"]
+            data -> [name, " ", Format.literal(slice(data, partial))]
+          end
       end)
       |> Enum.intersperse(" ")
 
     ["* ", Integer.to_string(seq), " FETCH (", parts, ")\r\n"]
   end
+
+  @doc """
+  Bytes of a section, or nil when the part does not exist. Top-level sections work
+  on the raw bytes alone; part paths need the MIME tree.
+  """
+  def extract(raw, _tree, {[], kind}), do: extract(raw, kind)
+
+  def extract(raw, tree, {path, kind}) do
+    case Mime.part(tree, path) do
+      nil ->
+        nil
+
+      node ->
+        case kind do
+          :full -> Mime.slice(raw, node["b"])
+          :mime -> Mime.slice(raw, node["h"])
+          # HEADER and TEXT exist only for an encapsulated message.
+          _ when not is_map_key(node, "m") -> ""
+          _ -> message_section(raw, node["m"], kind)
+        end
+    end
+  end
+
+  defp message_section(raw, msg, :header), do: Mime.slice(raw, msg["h"])
+  defp message_section(raw, msg, :text), do: Mime.slice(raw, msg["b"])
+
+  defp message_section(raw, msg, {_, _} = fields),
+    do: extract(Mime.slice(raw, msg["h"]), fields)
 
   @doc false
   def extract(raw, :full), do: raw

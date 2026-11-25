@@ -3,7 +3,7 @@ defmodule Mailstore.Core.NewMessage do
   A message ready to be stored: the raw bytes plus everything derived from them
   once, at delivery time, so reads never re-parse the body.
   """
-  alias Mailstore.Core.{Flags, Headers, MessageClass}
+  alias Mailstore.Core.{Flags, Headers, MessageClass, Mime}
 
   @enforce_keys [:raw]
   defstruct [
@@ -19,7 +19,8 @@ defmodule Mailstore.Core.NewMessage do
     :thread_id,
     :from_addr,
     :subject,
-    :envelope
+    :envelope,
+    :bodystructure
   ]
 
   @doc """
@@ -47,7 +48,8 @@ defmodule Mailstore.Core.NewMessage do
       thread_id: hash64(List.first(references) || in_reply_to || message_id),
       from_addr: Headers.address(Headers.get(headers, "from")),
       subject: Headers.get(headers, "subject"),
-      envelope: Headers.envelope(headers)
+      envelope: Headers.envelope(headers),
+      bodystructure: Mime.parse(raw)
     }
   end
 

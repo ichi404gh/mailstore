@@ -425,7 +425,8 @@ defmodule Mailstore.Imap.Session do
 
   defp fetch(s, uids, items) do
     %{account: account, folder: folder} = s
-    msgs = Mailbox.fetch_meta(account.tenant_id, folder.id, uids)
+    structure? = Fetch.needs_structure?(items)
+    msgs = Mailbox.fetch_meta(account.tenant_id, folder.id, uids, structure?)
 
     # A non-PEEK body fetch sets \Seen; report the new flags in the same response.
     {msgs, seen_now, s} =
@@ -444,10 +445,15 @@ defmodule Mailstore.Imap.Session do
         {msgs, MapSet.new(), s}
       end
 
-    raws =
-      if Fetch.needs_body?(items),
-        do: Mailbox.fetch_raw_many(account.tenant_id, folder.id, uids),
-        else: %{}
+    # Bodies for sections; rows stored before MIME parsing get their tree from the body.
+    raw_uids =
+      cond do
+        Fetch.needs_body?(items) -> uids
+        structure? -> for m <- msgs, m.bodystructure == nil, do: m.uid
+        true -> []
+      end
+
+    raws = Mailbox.fetch_raw_many(account.tenant_id, folder.id, raw_uids)
 
     out =
       for m <- msgs, seq = UidMap.seq(s.map, m.uid), seq != nil do

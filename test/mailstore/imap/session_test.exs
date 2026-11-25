@@ -109,10 +109,45 @@ defmodule Mailstore.Imap.SessionTest do
       assert out =~ ~r/RFC822.SIZE \d+ INTERNALDATE "\d\d-\w{3}-\d{4} /
     end
 
-    test "BODYSTRUCTURE is refused honestly" do
-      deliver()
-      {out, _} = cmd(selected(), "a1 FETCH 1 BODYSTRUCTURE")
-      assert out =~ "a1 BAD BODYSTRUCTURE is not implemented yet"
+    test "BODYSTRUCTURE without the body, part sections by stored offsets" do
+      raw =
+        "From: alice@example.org\r\nSubject: parts\r\n" <>
+          "Content-Type: multipart/mixed; boundary=b\r\n\r\n" <>
+          "--b\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nhello\r\n" <>
+          "--b\r\nContent-Type: text/html\r\nContent-Disposition: inline\r\n\r\n<b>hi</b>\r\n" <>
+          "--b--\r\n"
+
+      {:ok, _} = Delivery.deliver(raw, "bob@acme.test", class: :reply)
+      s = selected()
+
+      # Metadata only: one query, no body read.
+      {{out, s}, n} = queries(fn -> cmd(s, "a1 FETCH 1 (BODYSTRUCTURE)") end)
+      assert n == 1
+
+      assert out =~
+               ~s{* 1 FETCH (BODYSTRUCTURE (("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 5 1 } <>
+                 ~s{NIL NIL NIL NIL)("text" "html" ("charset" "us-ascii") NIL NIL "7bit" 9 1 } <>
+                 ~s{NIL ("inline" NIL) NIL NIL) "mixed" ("boundary" "b") NIL NIL NIL))}
+
+      {out, s} = cmd(s, "a2 FETCH 1 (BODY.PEEK[2] BODY.PEEK[2.MIME] BODY.PEEK[1]<1.3> BODY[9])")
+      assert out =~ "BODY[2] {9}\r\n<b>hi</b> "
+      assert out =~ "BODY[2.MIME] {56}\r\nContent-Type: text/html\r\n"
+      assert out =~ "BODY[1]<1> {3}\r\nell "
+      assert out =~ "BODY[9] NIL FLAGS (\\Seen))"
+
+      {out, _} = cmd(s, "a3 FETCH 1 FULL")
+
+      assert out =~
+               ~r/ENVELOPE \(.*\) BODY \(\("text" "plain" .* 5 1\)\("text" "html" .* 9 1\) "mixed"\)\)/
+    end
+
+    test "a row stored before MIME parsing gets its tree from the body" do
+      deliver(body: "short")
+      Mailstore.Repo.query!("UPDATE messages SET bodystructure = NULL")
+      {out, _} = cmd(selected(), "a1 FETCH 1 (BODY BODY.PEEK[1])")
+
+      assert out =~
+               ~s|BODY ("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 7 1) BODY[1] {7}|
     end
   end
 

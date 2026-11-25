@@ -55,7 +55,13 @@ defmodule Mailstore.Mailbox.Queries do
     if uids == :all, do: query, else: from(m in query, where: m.uid in ^uids)
   end
 
-  def meta(folder_id, uids) do
+  @doc "FETCH metadata; the MIME tree only when asked, it is the widest column."
+  def meta(folder_id, uids, structure? \\ false)
+
+  def meta(folder_id, uids, true),
+    do: from(m in meta(folder_id, uids, false), select_merge: %{bodystructure: m.bodystructure})
+
+  def meta(folder_id, uids, false) do
     from m in messages_in(folder_id),
       where: m.uid in ^uids,
       order_by: m.uid,

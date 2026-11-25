@@ -1,5 +1,5 @@
 defmodule Mailstore.Imap.Format do
-  @moduledoc "Rendering IMAP data items: strings, flag lists, dates, ENVELOPE."
+  @moduledoc "Rendering IMAP data items: strings, flag lists, dates, ENVELOPE, BODYSTRUCTURE."
   alias Mailstore.Core.Address
 
   @months ~w(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec)
@@ -93,6 +93,101 @@ defmodule Mailstore.Imap.Format do
   end
 
   def envelope(nil), do: envelope(%{})
+
+  @doc """
+  BODY (`extensible? = false`) or BODYSTRUCTURE from a `Mailstore.Core.Mime` tree.
+  Types and parameters are sent as stored (lowercase types, parameters as written),
+  the way Dovecot does.
+  """
+  def body_structure(node, extensible?)
+
+  def body_structure(%{"c" => children} = node, ext?) do
+    [
+      "(",
+      Enum.map(children, &body_structure(&1, ext?)),
+      " ",
+      string(node["s"]),
+      if(ext?,
+        do: [
+          " ",
+          params(node["p"]),
+          " ",
+          disposition(node["dp"]),
+          " ",
+          language(node["l"]),
+          " ",
+          string(node["lo"])
+        ],
+        else: []
+      ),
+      ")"
+    ]
+  end
+
+  def body_structure(node, ext?) do
+    [_, size] = node["b"]
+
+    fields = [
+      string(node["t"]),
+      string(node["s"]),
+      params(node["p"]),
+      string(node["id"]),
+      string(node["ds"]),
+      string(node["e"]),
+      Integer.to_string(size)
+    ]
+
+    type_specific =
+      case node do
+        %{"t" => "message", "s" => "rfc822"} ->
+          # An encoded or too deeply nested message is not parsed; the grammar still
+          # wants an envelope and a body, so send empty ones.
+          inner =
+            node["m"] ||
+              %{"t" => "text", "s" => "plain", "p" => [], "e" => "7bit", "b" => [0, 0], "n" => 0}
+
+          [envelope(node["env"]), body_structure(inner, ext?), Integer.to_string(node["n"] || 0)]
+
+        %{"t" => "text"} ->
+          [Integer.to_string(node["n"] || 0)]
+
+        _ ->
+          []
+      end
+
+    ext =
+      if ext?,
+        do: [
+          string(node["md5"]),
+          disposition(node["dp"]),
+          language(node["l"]),
+          string(node["lo"])
+        ],
+        else: []
+
+    ["(", Enum.intersperse(fields ++ type_specific ++ ext, " "), ")"]
+  end
+
+  defp params(nil), do: "NIL"
+  defp params([]), do: "NIL"
+
+  defp params(list) do
+    [
+      "(",
+      list |> Enum.flat_map(fn [k, v] -> [string(k), string(v)] end) |> Enum.intersperse(" "),
+      ")"
+    ]
+  end
+
+  defp disposition([type, p]), do: ["(", string(type), " ", params(p), ")"]
+  defp disposition(_), do: "NIL"
+
+  defp language([tag]), do: string(tag)
+
+  defp language([_ | _] = tags),
+    do: ["(", tags |> Enum.map(&string/1) |> Enum.intersperse(" "), ")"]
+
+  defp language(_), do: "NIL"
 
   defp addresses(value) do
     case Address.parse_list(value) do

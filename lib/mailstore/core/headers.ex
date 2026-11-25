@@ -1,9 +1,8 @@
 defmodule Mailstore.Core.Headers do
   @moduledoc """
-  Minimal RFC 5322 header parsing: enough for envelope, threading and indexes.
-  A full MIME parser (BODYSTRUCTURE, part offsets) comes later, likely as a Rust NIF
-  (`mail-parser`). Values are made valid UTF-8 here, because Postgres text and jsonb
-  reject anything else and raw 8-bit headers do occur.
+  Minimal RFC 5322 header parsing: enough for envelope, threading and indexes; the
+  MIME structure is `Mailstore.Core.Mime`. Values are made valid UTF-8 here, because
+  Postgres text and jsonb reject anything else and raw 8-bit headers do occur.
   """
 
   @doc "Split a raw message into {header_block, body}."

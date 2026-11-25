@@ -10,7 +10,7 @@ defmodule Mailstore.Imap.ImaplibTest do
   @script Path.expand("../../imaplib/client.py", __DIR__)
 
   @tag timeout: 60_000
-  test "python imaplib: login, list, select, append, fetch, store, search, copy, move, expunge, idle" do
+  test "python imaplib: login, list, select, append, fetch, store, search, copy, move, expunge, idle, bodystructure" do
     python = System.find_executable("python3") || flunk("python3 not found")
     account_fixture("bob@acme.test", password: "s3cret pass")
 

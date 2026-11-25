@@ -108,6 +108,29 @@ check(got == [b"1"], "EXISTS pushed during IDLE", got)
 typ, data = M.uid("FETCH", "1:*", "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
 check(b"pushed while idle" in data[0][1], "pushed message readable", data)
 
+step("bodystructure")
+mime = (
+    b"From: alice@example.org\r\nSubject: with attachment\r\nMIME-Version: 1.0\r\n"
+    b"Content-Type: multipart/mixed; boundary=xyz\r\n\r\n"
+    b"--xyz\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nsee attached\r\n"
+    b"--xyz\r\nContent-Type: application/pdf\r\nContent-Transfer-Encoding: base64\r\n"
+    + "Content-Disposition: attachment; filename=\"отчёт.pdf\"\r\n\r\n".encode()
+    + b"JVBERi0xLjQK\r\n--xyz--\r\n"
+)
+typ, data = M.append("Sent", r"(\Seen)", None, mime)
+check(typ == "OK", "append multipart", data)
+M.select("Sent")
+typ, data = M.uid("FETCH", "1", "(BODYSTRUCTURE)")
+# The non-ASCII filename comes as a literal, so imaplib splits the line around it.
+flat = b"".join(d if isinstance(d, bytes) else d[0] + d[1] for d in data)
+check(typ == "OK" and flat.count(b"(") == flat.count(b")"), "bodystructure balanced", data)
+check(b'("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 12 1 ' in flat, "text part", data)
+check(b'"base64" 12 NIL ("attachment" ("filename" {' in flat, "attachment part", data)
+check("отчёт.pdf".encode() in flat and b'"mixed" ("boundary" "xyz")' in flat, "filename", data)
+typ, data = M.uid("FETCH", "1", "(BODY.PEEK[2] BODY.PEEK[1.MIME])")
+check(data[0][1] == b"JVBERi0xLjQK", "part 2 bytes", data)
+check(data[1][1] == b"Content-Type: text/plain; charset=utf-8\r\n\r\n", "part 1 MIME", data)
+
 step("logout")
 typ, data = M.logout()
 check(typ == "BYE", "logout", data)
