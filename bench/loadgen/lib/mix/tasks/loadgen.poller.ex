@@ -10,6 +10,7 @@ defmodule Mix.Tasks.Loadgen.Poller do
     --cycle LIST            steps, see Loadgen.PollerSession (default noop,search_new,fetch_new)
     --duration SECONDS      measurement window after the ramp and warm-up (default 60)
     --deliver-rate N        new messages/s delivered to random users via :erpc (default 0)
+    --deliver-lmtp H:P      deliver over LMTP instead (servers without :erpc, e.g. Stalwart)
     --reconnect-mean SECS   reconnect after ~this lifetime (0 = never, default 0)
     --pg-container NAME     docker container of Postgres, to measure its CPU (default none)
 
@@ -27,6 +28,7 @@ defmodule Mix.Tasks.Loadgen.Poller do
           cycle: :string,
           duration: :integer,
           deliver_rate: :integer,
+          deliver_lmtp: :string,
           reconnect_mean: :integer,
           pg_container: :string
         ],
@@ -34,6 +36,7 @@ defmodule Mix.Tasks.Loadgen.Poller do
         cycle: "noop,search_new,fetch_new",
         duration: 60,
         deliver_rate: 0,
+        deliver_lmtp: "",
         reconnect_mean: 0,
         pg_container: ""
       )

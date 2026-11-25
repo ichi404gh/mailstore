@@ -13,6 +13,7 @@ defmodule Loadgen.CLI do
     report: :integer,
     source_ips: :string,
     server_node: :string,
+    server_pid: :integer,
     tls: :boolean
   ]
 
@@ -29,6 +30,8 @@ defmodule Loadgen.CLI do
     --tls                   connect with TLS (e.g. HAProxy on 10993; certificate not verified)
     --server-node NODE      e.g. mailstore@myhost: read server memory/CPU over :erpc
                             (start this VM with --sname and the server's --cookie)
+    --server-pid PID        OS process of the server (same machine): RSS and CPU time
+                            from `ps`. Works for any server, so use it to compare servers.
   """
 
   def common_help, do: @common_help
@@ -49,6 +52,7 @@ defmodule Loadgen.CLI do
       report: Keyword.get(opts, :report, 5),
       source_ips: opts |> Keyword.get(:source_ips, "") |> parse_ips(),
       server_node: server_node(opts[:server_node]),
+      server_pid: opts[:server_pid],
       tls: Keyword.get(opts, :tls, false)
     }
 

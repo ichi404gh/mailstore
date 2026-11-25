@@ -2,7 +2,7 @@ defmodule Loadgen.Runner do
   @moduledoc """
   Shared machinery for scenarios: ramping sessions up at a fixed rate, collecting their
   `{:ready | :failed | :push | :closed, ...}` messages, progress lines, setup latency
-  summary and server snapshots over `:erpc`.
+  summary and server snapshots: over `:erpc` (mailstore) or from `ps` (any server).
   """
 
   def new(cfg) do
@@ -141,5 +141,58 @@ defmodule Loadgen.Runner do
 
   def server_snapshot(%{server_node: node}, opts) do
     :erpc.call(node, Mailstore.Telemetry, :snapshot, [opts], 120_000)
+  end
+
+  @doc """
+  What the OS sees of the server process: `%{rss_kb, cpu_ms, wall_ms}`, or nil without
+  `--server-pid`. The same measurement for every server, unlike `server_snapshot/2`.
+  """
+  def os_snapshot(%{server_pid: nil}), do: nil
+
+  def os_snapshot(%{server_pid: pid}) do
+    {out, 0} = System.cmd("ps", ["-o", "rss=,cputime=", "-p", Integer.to_string(pid)])
+    [rss, cpu] = String.split(out)
+
+    %{
+      rss_kb: String.to_integer(rss),
+      cpu_ms: cputime_ms(cpu),
+      wall_ms: System.monotonic_time(:millisecond)
+    }
+  end
+
+  # ps cputime: [[dd-]hh:]mm:ss.cc
+  defp cputime_ms(s) do
+    {days, rest} =
+      case String.split(s, "-") do
+        [d, rest] -> {String.to_integer(d), rest}
+        [rest] -> {0, rest}
+      end
+
+    secs =
+      rest
+      |> String.split(":")
+      |> Enum.reduce(0.0, fn part, acc -> acc * 60 + parse_num(part) end)
+
+    round((days * 86_400 + secs) * 1000)
+  end
+
+  defp parse_num(part) do
+    case Float.parse(part) do
+      {f, ""} -> f
+      _ -> 0.0
+    end
+  end
+
+  def os_summary(_label, nil, _later, _sessions), do: :ok
+
+  def os_summary(label, base, later, sessions) do
+    per = if sessions > 0, do: Float.round((later.rss_kb - base.rss_kb) / sessions, 1), else: 0.0
+    cores = (later.cpu_ms - base.cpu_ms) / max(later.wall_ms - base.wall_ms, 1)
+
+    IO.puts(
+      "   server process (ps) #{label}: RSS #{Float.round(base.rss_kb / 1024, 1)} -> " <>
+        "#{Float.round(later.rss_kb / 1024, 1)} MB, #{per} KB per session; " <>
+        "CPU #{later.cpu_ms - base.cpu_ms} ms (#{Float.round(cores, 2)} cores)"
+    )
   end
 end

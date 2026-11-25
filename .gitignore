@@ -28,3 +28,7 @@ _build/
 deps/
 .elixir_ls/
 .DS_Store
+
+# Stalwart comparison stand: downloaded binary and run state (bench/stalwart/README.md).
+/bench/stalwart/.bin/
+/bench/stalwart/.run/

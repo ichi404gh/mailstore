@@ -32,7 +32,8 @@ defmodule Loadgen.IdleSession do
   defp setup(sock, user, folder, password, until) do
     steps = [
       {"login", fn -> login(sock, user, password) end},
-      {"select", fn -> ok(ImapClient.command(sock, "a2", "SELECT #{folder}"), :select) end},
+      {"select",
+       fn -> ok(ImapClient.command(sock, "a2", "SELECT #{quote_string(folder)}"), :select) end},
       {"idle", fn -> with(:ok <- ImapClient.idle(sock, "a3"), do: {:ok, :idle}) end}
     ]
 

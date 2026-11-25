@@ -11,6 +11,7 @@ defmodule Loadgen.Idle do
 
   def run(cfg) do
     baseline = Runner.server_snapshot(cfg)
+    os0 = Runner.os_snapshot(cfg)
 
     IO.puts(
       "idle scenario: #{cfg.sessions} sessions over #{cfg.users} users (#{Enum.join(cfg.folders, ",")}) " <>
@@ -37,10 +38,12 @@ defmodule Loadgen.Idle do
     )
 
     memory_summary(st, baseline, Runner.server_snapshot(cfg))
+    Runner.os_summary("after ramp", os0, Runner.os_snapshot(cfg), st.ready)
 
     st = Runner.hold(st, cfg.hold * 1000)
     IO.puts("\nhold done: pushes received=#{st.pushes} closed by server=#{st.closed}")
     after_hold(st, baseline, Runner.server_snapshot(cfg))
+    Runner.os_summary("after hold", os0, Runner.os_snapshot(cfg), st.ready)
     Runner.stop_all(st)
   end
 
