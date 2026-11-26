@@ -46,7 +46,7 @@ flowchart LR
   hap -->|"PROXY v2 + IMAP"| compute
   smtp --> queue
   queue -->|"Ingest: Broadway,<br/>групповая запись"| compute
-  dir -.->|"зеркало в ETS"| compute
+  dir -->|"зеркало в ETS на каждой ноде"| compute
   compute -->|"шард по tenant"| storage
   compute -->|"загрузка pack-файлов,<br/>Range GET"| obj
   compute -.->|"копии на внешние адреса"| relay
@@ -107,9 +107,9 @@ flowchart TB
   l2 --> c2["Connection"]
   l1 --> c3["Connection"]
 
-  c1 -. "подписка на папку" .-> a1
-  c2 -. "подписка на папку" .-> a1
-  c3 -. "подписка на папку" .-> a2
+  c1 -->|"подписка на папку"| a1
+  c2 -->|"подписка на папку"| a1
+  c3 -->|"подписка на папку"| a2
 ```
 
 `Imap.Session` — не процесс, а чистая машина состояний внутри `Connection`: на вход команда или уведомление актора, на выход байты ответа.
