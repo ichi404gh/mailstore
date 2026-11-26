@@ -6,9 +6,13 @@ defmodule Mailstore.Imap.Search do
   sequence sets from the session's UID map without the database, pure UNSEEN from the
   partial index, flags/size/dates from narrow rows, headers from the envelope, and
   bodies only for TEXT, BODY and HEADER on non-envelope fields.
-  SENTBEFORE/SENTON/SENTSINCE use the internal date as an approximation.
+
+  SENTBEFORE/SENTON/SENTSINCE compare the calendar date of the Date header in its own
+  time zone (RFC 3501 6.4.4), falling back to the internal date when Date is missing or
+  unparsable. FROM/TO/CC/BCC match the raw header or any parsed address, so comments
+  and groups do not hide an address.
   """
-  alias Mailstore.Core.Headers
+  alias Mailstore.Core.{Address, Headers}
   alias Mailstore.Core.UidMap
   alias Mailstore.Imap.{Format, SequenceSet}
 
@@ -32,13 +36,15 @@ defmodule Mailstore.Imap.Search do
     "SUBJECT" => "subject"
   }
   @date_keys %{
-    "BEFORE" => :before,
-    "ON" => :on,
-    "SINCE" => :since,
-    "SENTBEFORE" => :before,
-    "SENTON" => :on,
-    "SENTSINCE" => :since
+    "BEFORE" => {:date, :before},
+    "ON" => {:date, :on},
+    "SINCE" => {:date, :since},
+    "SENTBEFORE" => {:sent, :before},
+    "SENTON" => {:sent, :on},
+    "SENTSINCE" => {:sent, :since}
   }
+  @address_fields ~w(from to cc bcc)
+  @months ~w(jan feb mar apr may jun jul aug sep oct nov dec)
   # Header fields kept in the envelope column (key in the stored map).
   @envelope_fields %{
     "date" => "date",
@@ -85,11 +91,18 @@ defmodule Mailstore.Imap.Search do
     up = String.upcase(a)
 
     cond do
-      up == "ALL" or up == "OLD" ->
+      up == "ALL" ->
         {:ok, :all, rest}
 
-      up == "NEW" or up == "RECENT" ->
-        {:ok, :none, rest}
+      # \\Recent is per session: the session passes its recent UIDs in the context.
+      up == "RECENT" ->
+        {:ok, :recent, rest}
+
+      up == "OLD" ->
+        {:ok, {:not, :recent}, rest}
+
+      up == "NEW" ->
+        {:ok, {:and, [:recent, {:flag, "\\Seen", false}]}, rest}
 
       Map.has_key?(@flag_keys, up) ->
         flag_key(@flag_keys[up], rest)
@@ -152,9 +165,9 @@ defmodule Mailstore.Imap.Search do
 
   defp number(_, _), do: {:error, "Missing number"}
 
-  defp date([v | rest], op) do
+  defp date([v | rest], {kind, op}) do
     case Format.parse_date(value(v)) do
-      {:ok, d} -> {:ok, {:date, op, d}, rest}
+      {:ok, d} -> {:ok, {kind, op, d}, rest}
       :error -> {:error, "Invalid date"}
     end
   end
@@ -183,11 +196,13 @@ defmodule Mailstore.Imap.Search do
   def needs(:all), do: :ids
   def needs(:none), do: :ids
   def needs({:seqset, _}), do: :ids
+  def needs(:recent), do: :ids
   def needs({:uidset, _}), do: :ids
   def needs({:flag, _, _}), do: :flags
   def needs({:larger, _}), do: :flags
   def needs({:smaller, _}), do: :flags
   def needs({:date, _, _}), do: :flags
+  def needs({:sent, _, _}), do: :full
   def needs({:not, a}), do: needs(a)
   def needs({:or, a, b}), do: max_need(needs(a), needs(b))
   def needs({:and, keys}), do: Enum.reduce(keys, :ids, &max_need(needs(&1), &2))
@@ -234,6 +249,7 @@ defmodule Mailstore.Imap.Search do
 
   defp match(:all, _m, _), do: true
   defp match(:none, _m, _), do: false
+  defp match(:recent, m, ctx), do: MapSet.member?(Map.get(ctx, :recent, MapSet.new()), m.uid)
   defp match({:and, keys}, m, ctx), do: Enum.all?(keys, &match(&1, m, ctx))
   defp match({:or, a, b}, m, ctx), do: match(a, m, ctx) or match(b, m, ctx)
   defp match({:not, a}, m, ctx), do: not match(a, m, ctx)
@@ -245,13 +261,23 @@ defmodule Mailstore.Imap.Search do
   defp match({:body, s}, m, _), do: contains?(body_text(m.raw), s)
   defp match({:text, s}, m, _), do: contains?(m.raw, s)
 
-  defp match({:date, op, d}, m, _) do
-    cmp = Date.compare(DateTime.to_date(m.internal_date), d)
+  defp match({:date, op, d}, m, _), do: compare_date(DateTime.to_date(m.internal_date), op, d)
 
-    case op do
-      :before -> cmp == :lt
-      :on -> cmp == :eq
-      :since -> cmp != :lt
+  defp match({:sent, op, d}, m, _) do
+    sent = sent_date((m.envelope || %{})["date"]) || DateTime.to_date(m.internal_date)
+    compare_date(sent, op, d)
+  end
+
+  defp match({:header, field, s}, m, _) when field in @address_fields do
+    case header_value(m, field) do
+      nil ->
+        false
+
+      value ->
+        s == "" or contains?(value, s) or
+          Enum.any?(Address.mailboxes(value), fn a ->
+            contains?("#{a.mailbox}@#{a.host}", s) or contains?(a.name, s)
+          end)
     end
   end
 
@@ -259,6 +285,16 @@ defmodule Mailstore.Imap.Search do
     case header_value(m, field) do
       nil -> false
       value -> s == "" or contains?(value, s)
+    end
+  end
+
+  defp compare_date(date, op, d) do
+    cmp = Date.compare(date, d)
+
+    case op do
+      :before -> cmp == :lt
+      :on -> cmp == :eq
+      :since -> cmp != :lt
     end
   end
 
@@ -272,6 +308,24 @@ defmodule Mailstore.Imap.Search do
         if values == [], do: nil, else: Enum.join(values, " ")
     end
   end
+
+  # Calendar date of an RFC 5322 date in its own zone: "Sun, 25 Mar 2007 01:00:00 +0200".
+  defp sent_date(nil), do: nil
+
+  defp sent_date(value) do
+    with [_, d, mon, y] <- Regex.run(~r/(\d{1,2})\s+([A-Za-z]{3})\s+(\d{2,4})/, value),
+         i when i != nil <- Enum.find_index(@months, &(&1 == String.downcase(mon))),
+         {:ok, date} <- Date.new(full_year(String.to_integer(y)), i + 1, String.to_integer(d)) do
+      date
+    else
+      _ -> nil
+    end
+  end
+
+  # RFC 5322 4.3: two-digit years 00-49 are 20xx, 50-99 are 19xx.
+  defp full_year(y) when y < 50, do: 2000 + y
+  defp full_year(y) when y < 100, do: 1900 + y
+  defp full_year(y), do: y
 
   defp has_flag?(flags, "\\" <> _ = name),
     do: Enum.any?(flags, &(String.downcase(&1) == String.downcase(name)))

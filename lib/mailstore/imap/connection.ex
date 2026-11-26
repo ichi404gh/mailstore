@@ -90,7 +90,14 @@ defmodule Mailstore.Imap.Connection do
   def handle_info({:mailstore, _, _} = push, st) do
     {out, session} = Session.handle_push(push, st.session)
     send_out(st, out)
-    {:noreply, track_actor(%{st | session: session})}
+    st = track_actor(%{st | session: session})
+
+    if Session.logout?(session) do
+      st.transport.close(st.socket)
+      {:stop, :normal, st}
+    else
+      {:noreply, st}
+    end
   end
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{actor_ref: ref} = st) do

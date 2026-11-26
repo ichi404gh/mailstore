@@ -67,7 +67,7 @@ defmodule Mailstore.Core.MimeTest do
   test "parts, offsets and parameters", %{tree: tree} do
     assert %{"t" => "multipart", "s" => "mixed", "c" => [alt, pdf, fwd]} = tree
     assert %{"s" => "alternative", "c" => [plain, html]} = alt
-    assert %{"t" => "text", "s" => "plain", "e" => "quoted-printable", "n" => 2} = plain
+    assert %{"t" => "text", "s" => "plain", "e" => "quoted-printable", "n" => 1} = plain
     assert plain["p"] == [["charset", "utf-8"]]
     assert Mime.slice(@raw, plain["b"]) == "Hello Bob,\r\nsee attached."
     assert Mime.slice(@raw, html["b"]) == "<p>Hello Bob</p>"
@@ -76,7 +76,7 @@ defmodule Mailstore.Core.MimeTest do
     assert Mime.slice(@raw, pdf["b"]) == "JVBERi0xLjQK"
 
     assert fwd["env"]["subject"] == "original"
-    assert %{"t" => "text", "s" => "plain", "n" => 1} = fwd["m"]
+    assert %{"t" => "text", "s" => "plain", "n" => 0} = fwd["m"]
     assert Mime.slice(@raw, fwd["m"]["b"]) == "Original text."
   end
 
@@ -105,21 +105,21 @@ defmodule Mailstore.Core.MimeTest do
     carol = ~s{((NIL NIL "carol" "example.org"))}
 
     assert bs ==
-             ~s{((("text" "plain" ("charset" "utf-8") NIL NIL "quoted-printable" 25 2 NIL NIL NIL NIL)} <>
-               ~s{("text" "html" ("charset" "utf-8") NIL NIL "7bit" 16 1 NIL NIL NIL NIL)} <>
+             ~s{((("text" "plain" ("charset" "utf-8") NIL NIL "quoted-printable" 25 1 NIL NIL NIL NIL)} <>
+               ~s{("text" "html" ("charset" "utf-8") NIL NIL "7bit" 16 0 NIL NIL NIL NIL)} <>
                ~s{ "alternative" ("boundary" "inner") NIL NIL NIL)} <>
                ~s{("application" "pdf" ("name" "report.pdf") NIL NIL "base64" 12 NIL } <>
                ~s{("attachment" ("filename" "quarterly report.pdf")) NIL NIL)} <>
                ~s{("message" "rfc822" NIL NIL NIL "7bit" 92 } <>
                ~s{(NIL "original" #{carol} #{carol} #{carol} NIL NIL NIL NIL "<orig@example.org>") } <>
-               ~s{("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 14 1 NIL NIL NIL NIL) 5 } <>
+               ~s{("text" "plain" ("charset" "us-ascii") NIL NIL "7bit" 14 0 NIL NIL NIL NIL) 4 } <>
                ~s{NIL NIL NIL NIL)} <>
                ~s{ "mixed" ("boundary" "outer") NIL NIL NIL)}
 
     body = tree |> Format.body_structure(false) |> IO.iodata_to_binary()
 
     assert body =~
-             ~r/^\(\(\("text" "plain" \("charset" "utf-8"\) NIL NIL "quoted-printable" 25 2\)/
+             ~r/^\(\(\("text" "plain" \("charset" "utf-8"\) NIL NIL "quoted-printable" 25 1\)/
 
     assert body =~ ~r/ "mixed"\)$/
   end
@@ -171,9 +171,26 @@ defmodule Mailstore.Core.MimeTest do
     assert %{"t" => "text", "s" => "plain"} = List.last(chain)
   end
 
+  test "parameters keep their case; RFC 2231 values are decoded like Dovecot does" do
+    raw =
+      "Content-Type: application/octet-stream; Name=f.bin\r\n" <>
+        "Content-Disposition: attachment; filename*=utf-8''%D1%84%D0%B0%D0%B9%D0%BB.bin;\r\n" <>
+        " title*0*=iso-8859-1''caf%E9; title*1=\" au lait\"; other*=koi8-r''%C6%C1\r\n\r\nx"
+
+    tree = Mime.parse(raw)
+    assert tree["p"] == [["Name", "f.bin"]]
+    assert Mime.param(tree["p"], "name") == "f.bin"
+
+    assert tree["dp"] ==
+             [
+               "attachment",
+               [["filename", "файл.bin"], ["title", "café au lait"], ["other*", "koi8-r''%C6%C1"]]
+             ]
+  end
+
   test "multipart without a usable boundary degrades to text/plain" do
     raw = "Content-Type: multipart/mixed\r\n\r\nno parts here"
-    assert %{"t" => "text", "s" => "plain", "n" => 1} = Mime.parse(raw)
+    assert %{"t" => "text", "s" => "plain", "n" => 0} = Mime.parse(raw)
   end
 
   test "a delimiter must start a line and end it" do

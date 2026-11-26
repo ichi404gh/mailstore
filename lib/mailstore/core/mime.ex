@@ -18,13 +18,13 @@ defmodule Mailstore.Core.Mime do
       "lo"       Content-Location
       "h"        [offset, length] of the header block, including the empty line
       "b"        [offset, length] of the body (transfer-encoded bytes)
-      "n"        lines in the body (text/* and message/rfc822)
+      "n"        lines in the body: LFs, as Dovecot counts (text/* and message/rfc822)
       "c"        child nodes (multipart)
       "m", "env" encapsulated message node and its ENVELOPE fields (message/rfc822)
 
   Absent keys mean NIL. Header values are made valid UTF-8 (jsonb rejects anything
-  else); parameters are passed through as written, except that RFC 2231 continuations
-  (`name*0`, `name*1*`) are joined, like Dovecot does. The parser never fails: malformed
+  else); parameters keep their names' case and values as written, except that RFC 2231
+  continuations are joined and charset-encoded values decoded to UTF-8, like Dovecot. The parser never fails: malformed
   input degrades to text/plain or to fewer parts.
   """
   alias Mailstore.Core.Headers
@@ -242,13 +242,10 @@ defmodule Mailstore.Core.Mime do
     end
   end
 
+  # Line count as Dovecot reports it: the number of LFs (a last line without one does
+  # not count).
   defp lines(_raw, _start, 0), do: 0
-
-  defp lines(raw, start, len) do
-    body = binary_part(raw, start, len)
-    n = length(:binary.matches(body, "\n"))
-    if :binary.last(body) == ?\n, do: n, else: n + 1
-  end
+  defp lines(raw, start, len), do: length(:binary.matches(binary_part(raw, start, len), "\n"))
 
   ## Header values
 
@@ -311,8 +308,10 @@ defmodule Mailstore.Core.Mime do
   end
 
   @doc false
+  # Parameter names keep the case they were written in (as Dovecot shows them), so
+  # lookups ignore case.
   def param(params, name) do
-    Enum.find_value(params, fn [k, v] -> if k == name, do: v end)
+    Enum.find_value(params, fn [k, v] -> if String.downcase(k) == name, do: v end)
   end
 
   # "type/sub; a=1; b=\"x;y\"" -> {"type/sub", [["a", "1"], ["b", "x;y"]]}
@@ -324,14 +323,14 @@ defmodule Mailstore.Core.Mime do
       |> Enum.flat_map(fn p ->
         case :binary.split(p, "=") do
           [k, v] ->
-            k = k |> String.trim() |> String.downcase()
+            k = String.trim(k)
             if k == "", do: [], else: [[k, unquote_value(String.trim(v))]]
 
           _ ->
             []
         end
       end)
-      |> join_continuations()
+      |> rfc2231()
 
     {String.trim(main), params}
   end
@@ -362,32 +361,80 @@ defmodule Mailstore.Core.Mime do
 
   defp unquote_value(v), do: v
 
-  # RFC 2231: name*0="a" name*1="b" -> name="ab"; name*0*=utf-8''a name*1*=b -> name*=...
-  # Charset decoding is left to the client, as Dovecot does.
-  defp join_continuations(params) do
-    if Enum.any?(params, fn [k, _] -> k =~ ~r/\*\d+\*?$/ end) do
-      {plain, segments} =
-        Enum.split_with(params, fn [k, _] -> not (k =~ ~r/\*\d+\*?$/) end)
+  # RFC 2231, decoded as Dovecot does: continuations (`name*0`, `name*1*`) are joined,
+  # charset-encoded values (`name*=utf-8''%D1%84...`) become plain UTF-8 under `name`.
+  # A charset we cannot convert keeps the encoded form under `name*`.
+  defp rfc2231(params) do
+    {order, groups} =
+      Enum.reduce(params, {[], %{}}, fn [k, v], {order, groups} ->
+        case Regex.run(~r/^(.+?)\*(\d+)?(\*)?$/, k) do
+          nil ->
+            {[{:plain, k, v} | order], groups}
 
-      joined =
-        segments
-        |> Enum.map(fn [k, v] ->
-          [_, name, n, star] = Regex.run(~r/^(.*)\*(\d+)(\*?)$/, k)
-          {name, String.to_integer(n), star == "*", v}
-        end)
-        |> Enum.group_by(&elem(&1, 0))
-        |> Enum.map(fn {name, segs} ->
-          segs = Enum.sort_by(segs, &elem(&1, 1))
-          extended? = segs |> hd() |> elem(2)
-          value = Enum.map_join(segs, &elem(&1, 3))
-          [if(extended?, do: name <> "*", else: name), value]
-        end)
-        |> Enum.sort()
+          [_, name | rest] ->
+            {n, ext?} =
+              case rest do
+                [] -> {0, true}
+                ["", "*"] -> {0, true}
+                [n] -> {String.to_integer(n), false}
+                [n, star] -> {String.to_integer(n), star == "*"}
+              end
 
-      plain ++ joined
-    else
-      params
+            key = String.downcase(name)
+            order = if Map.has_key?(groups, key), do: order, else: [{:group, key} | order]
+            {order, Map.update(groups, key, [{n, ext?, v, name}], &[{n, ext?, v, name} | &1])}
+        end
+      end)
+
+    order
+    |> Enum.reverse()
+    |> Enum.map(fn
+      {:plain, k, v} -> [k, v]
+      {:group, key} -> decode_segments(Enum.sort_by(groups[key], &elem(&1, 0)))
+    end)
+  end
+
+  defp decode_segments([{_, first_ext?, _, name} | _] = segs) do
+    {charset, parts} =
+      segs
+      |> Enum.with_index()
+      |> Enum.map_reduce(nil, fn
+        {{_, true, v, _}, 0}, _ ->
+          case String.split(v, "'", parts: 3) do
+            [charset, _lang, text] -> {percent_decode(text), String.downcase(charset)}
+            _ -> {percent_decode(v), nil}
+          end
+
+        {{_, true, v, _}, _}, cs ->
+          {percent_decode(v), cs}
+
+        {{_, false, v, _}, _}, cs ->
+          {v, cs}
+      end)
+      |> then(fn {parts, cs} -> {cs, parts} end)
+
+    raw = Enum.join(parts)
+
+    case to_utf8(charset, raw, first_ext?) do
+      {:ok, text} -> [name, text]
+      :error -> [name <> "*", Enum.map_join(segs, &elem(&1, 2))]
     end
+  end
+
+  defp to_utf8(_charset, raw, false), do: if(String.valid?(raw), do: {:ok, raw}, else: :error)
+
+  defp to_utf8(charset, raw, true) when charset in [nil, "", "utf-8", "utf8", "us-ascii"],
+    do: if(String.valid?(raw), do: {:ok, raw}, else: :error)
+
+  defp to_utf8(charset, raw, true) when charset in ["iso-8859-1", "latin1"],
+    do: {:ok, :unicode.characters_to_binary(raw, :latin1)}
+
+  defp to_utf8(_charset, _raw, true), do: :error
+
+  defp percent_decode(text) do
+    URI.decode(text)
+  rescue
+    ArgumentError -> text
   end
 
   defp put(map, _key, nil), do: map

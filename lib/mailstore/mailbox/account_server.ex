@@ -10,7 +10,8 @@ defmodule Mailstore.Mailbox.AccountServer do
   * Serializes writes for the account and pushes deltas to the sessions that have the
     affected folder selected. Reads (FETCH, SEARCH) go straight to the shard (`Mailstore.Mailbox` read functions).
   * Keeps the state of the folders sessions open: all UIDs and unseen UIDs, as
-    `Mailstore.Core.UidMap` runs (a 2 000-message folder without holes is ~200 bytes).
+    `Mailstore.Core.UidMap` runs (a 2 000-message folder without holes is ~200 bytes),
+    and the keywords in use (for the FLAGS response).
     Loaded on the first subscribe, kept current by its own writes, dropped on COPY/MOVE
     into the folder and on `reload_all/0`. SELECT and SEARCH UNSEEN read it instead of
     the database.
@@ -19,21 +20,29 @@ defmodule Mailstore.Mailbox.AccountServer do
   consistent hashing of `account_id` and callers reach it via `:erpc`. Correctness
   does not depend on there being exactly one actor; see `Mailstore.Mailbox.Commands`.
 
-  `subscribe/2` returns the folder view plus a snapshot taken atomically with the
-  subscription: `:uids` (a `UidMap`) and `:first_unseen` (UID or nil). Every change
+  `subscribe/3` returns the folder view plus a snapshot taken atomically with the
+  subscription: `:uids` (a `UidMap`), `:first_unseen` (UID or nil), `:keywords` and
+  `:recent` (UIDs that are \\Recent for this session).
+
+  \\Recent (RFC 3501 2.3.2): a message is recent in exactly one session, the first that
+  selects the folder read-write after it arrived, or the read-write session that has the
+  folder selected when it arrives (its push is `{:exists, uids, view, :recent}`). The
+  actor tracks the first unclaimed UID per folder in memory only, starting at UIDNEXT
+  when it starts: \\Recent is advisory and gone in IMAP4rev2. Every change
   after it arrives as a push, so the session needs no database query and has no window
   in which a change could be missed.
 
   Subscriber messages: `{:mailstore, folder_id, event}` where event is one of
   `{:exists, uids, view}`, `{:flags, changes, modseq}`, `{:expunge, uids, modseq}`,
-  `{:reload, view}`. A session should monitor the pid returned by `subscribe/2` and
+  `{:reload, view}`, `{:renamed, view}` (the folder or one above it was renamed: the
+  view has the new name), `:deleted` (the folder no longer exists). A session should monitor the pid returned by `subscribe/2` and
   resubscribe (then resync by MODSEQ) if it goes down.
   """
   use GenServer, restart: :transient
   require Logger
 
   alias Mailstore.{Directory, Shards}
-  alias Mailstore.Core.{Flags, UidMap}
+  alias Mailstore.Core.{FolderName, Flags, UidMap}
   alias Mailstore.Mailbox.{Commands, Queries}
 
   @registry Mailstore.Mailbox.Registry
@@ -73,8 +82,13 @@ defmodule Mailstore.Mailbox.AccountServer do
 
   # ---- API ----------------------------------------------------------------
 
-  @doc "Select a folder: returns {:ok, actor_pid, view} and starts pushing deltas to the caller."
-  def subscribe(account_id, folder), do: call(account_id, {:subscribe, folder, self()})
+  @doc """
+  Select a folder: returns {:ok, actor_pid, view} and starts pushing deltas to the caller.
+  `read_only: true` (EXAMINE) shows \\Recent messages without claiming them.
+  """
+  def subscribe(account_id, folder, opts \\ []),
+    do: call(account_id, {:subscribe, folder, self(), Keyword.get(opts, :read_only, false)})
+
   def unsubscribe(account_id), do: call(account_id, {:unsubscribe, self()})
 
   @doc "SELECT/STATUS data from memory: no database round trip."
@@ -92,6 +106,28 @@ defmodule Mailstore.Mailbox.AccountServer do
     do: call(account_id, {:store, folder, uids, op, flags})
 
   def expunge(account_id, folder, uids \\ :all), do: call(account_id, {:expunge, folder, uids})
+
+  @doc """
+  CREATE, with any missing parents. Errors: `:invalid_name`, `:already_exists`.
+  """
+  def create_folder(account_id, name), do: call(account_id, {:create_folder, name})
+
+  @doc """
+  DELETE with all messages. Errors: `:no_such_folder`, `:inbox`, `:has_children`
+  (delete the children first, as Dovecot requires). Sessions that have it selected get
+  `:deleted`.
+  """
+  def delete_folder(account_id, name), do: call(account_id, {:delete_folder, name})
+
+  @doc """
+  RENAME, children included; UIDs and UIDVALIDITY stay. Errors: `:no_such_folder`,
+  `:already_exists`, `:inbox` (renaming INBOX is not supported), `:invalid_name`,
+  `:into_itself`. Sessions on a renamed folder get `{:renamed, view}`.
+  """
+  def rename_folder(account_id, old, new), do: call(account_id, {:rename_folder, old, new})
+
+  @doc "SUBSCRIBE / UNSUBSCRIBE an existing folder. Error: `:no_such_folder`."
+  def set_subscribed(account_id, name, on?), do: call(account_id, {:set_subscribed, name, on?})
 
   @doc "Returns {:ok, %{uidvalidity, mapping: [{src_uid, dst_uid}]}} (for COPYUID)."
   def copy(account_id, from, uids, to), do: call(account_id, {:copy, from, uids, to})
@@ -132,28 +168,41 @@ defmodule Mailstore.Mailbox.AccountServer do
       account ->
         repo = Shards.repo(account.tenant_id)
 
-        state = %{
-          account_id: account_id,
-          tenant_id: account.tenant_id,
-          repo: repo,
-          folders: load_folders(repo, account_id),
-          cache: %{},
-          subs: %{},
-          idle_timeout: Application.get_env(:mailstore, :account_idle_timeout, :timer.minutes(10))
-        }
+        state =
+          track_recent(%{
+            account_id: account_id,
+            tenant_id: account.tenant_id,
+            repo: repo,
+            folders: load_folders(repo, account_id),
+            recent_from: %{},
+            cache: %{},
+            subs: %{},
+            idle_timeout:
+              Application.get_env(:mailstore, :account_idle_timeout, :timer.minutes(10))
+          })
 
         {:ok, state, state.idle_timeout}
     end
   end
 
   @impl true
-  def handle_call({:subscribe, name, pid}, _from, st) do
+  def handle_call({:subscribe, name, pid, read_only}, _from, st) do
     with {:ok, f} <- folder(st, name),
          {:ok, cached, st} <- cached(st, f) do
       st = drop_sub(st, pid)
       ref = Process.monitor(pid)
-      st = put_in(st.subs[pid], {f.id, ref})
-      view = Map.merge(f, %{uids: cached.uids, first_unseen: UidMap.uid(cached.unseen, 1)})
+      st = put_in(st.subs[pid], {f.id, ref, not read_only})
+      recent = UidMap.uids_between(cached.uids, recent_from(st, f), UidMap.max_uid(cached.uids))
+      st = if read_only, do: st, else: put_in(st.recent_from[f.id], f.uidnext)
+
+      view =
+        Map.merge(f, %{
+          uids: cached.uids,
+          first_unseen: UidMap.uid(cached.unseen, 1),
+          keywords: cached.keywords |> MapSet.to_list() |> Enum.sort(),
+          recent: recent
+        })
+
       reply({:ok, self(), view}, st)
     else
       error -> reply(error, st)
@@ -171,22 +220,33 @@ defmodule Mailstore.Mailbox.AccountServer do
 
   def handle_call({:unsubscribe, pid}, _from, st), do: reply(:ok, drop_sub(st, pid))
 
-  def handle_call({:status, name}, _from, st), do: reply(folder(st, name), st)
+  def handle_call({:status, name}, _from, st) do
+    case folder(st, name) do
+      {:ok, f} -> reply({:ok, Map.put(f, :recent, recent_count(st, f))}, st)
+      error -> reply(error, st)
+    end
+  end
 
   def handle_call({:append, name, msgs, opts}, _from, st) do
     with {:ok, f} <- folder(st, name),
          {:ok, {uids, counters}} <-
            tx(st, fn -> Commands.append(st.repo, f.id, st.tenant_id, msgs, opts) end) do
       unseen = for {m, uid} <- Enum.zip(msgs, uids), not Flags.seen?(m.flags_mask), do: uid
+      keywords = Enum.flat_map(msgs, & &1.keywords)
 
       st =
         st
         |> put_counters(name, counters)
         |> update_cache(f.id, fn c ->
-          %{c | uids: UidMap.append(c.uids, uids), unseen: UidMap.append(c.unseen, unseen)}
+          %{
+            c
+            | uids: UidMap.append(c.uids, uids),
+              unseen: UidMap.append(c.unseen, unseen),
+              keywords: MapSet.union(c.keywords, MapSet.new(keywords))
+          }
         end)
 
-      notify(st, f.id, {:exists, uids, st.folders[norm(name)]})
+      st = notify_exists(st, f.id, uids, st.folders[norm(name)])
       reply({:ok, uids}, st)
     else
       error -> reply(error, st)
@@ -206,7 +266,13 @@ defmodule Mailstore.Mailbox.AccountServer do
         |> put_counters(name, counters)
         |> update_cache(f.id, fn c ->
           {_, without_seen} = UidMap.remove(c.unseen, Enum.map(seen, & &1.uid))
-          %{c | unseen: UidMap.put(without_seen, Enum.map(unseen, & &1.uid))}
+          keywords = MapSet.new(Enum.flat_map(changes, & &1.keywords))
+
+          %{
+            c
+            | unseen: UidMap.put(without_seen, Enum.map(unseen, & &1.uid)),
+              keywords: MapSet.union(c.keywords, keywords)
+          }
         end)
 
       changes =
@@ -242,8 +308,10 @@ defmodule Mailstore.Mailbox.AccountServer do
       # Copies keep their source flags, which the actor may not have: reload on next use.
       st = st |> put_counters(to, counters) |> drop_cache(dst.id)
 
-      if mapping != [],
-        do: notify(st, dst.id, {:exists, Enum.map(mapping, &elem(&1, 1)), st.folders[norm(to)]})
+      st =
+        if mapping != [],
+          do: notify_exists(st, dst.id, Enum.map(mapping, &elem(&1, 1)), st.folders[norm(to)]),
+          else: st
 
       reply({:ok, %{uidvalidity: dst.uidvalidity, mapping: mapping}}, st)
     else
@@ -279,12 +347,78 @@ defmodule Mailstore.Mailbox.AccountServer do
         |> drop_cache(dst.id)
         |> forget_uids(src.id, expunged)
 
-      if mapping != [] do
-        notify(st, dst.id, {:exists, Enum.map(mapping, &elem(&1, 1)), st.folders[norm(to)]})
-        notify(st, src.id, {:expunge, expunged, modseq})
-      end
+      st =
+        if mapping != [] do
+          notify(st, src.id, {:expunge, expunged, modseq})
+          notify_exists(st, dst.id, Enum.map(mapping, &elem(&1, 1)), st.folders[norm(to)])
+        else
+          st
+        end
 
       reply({:ok, %{uidvalidity: dst.uidvalidity, mapping: mapping}}, st)
+    else
+      error -> reply(error, st)
+    end
+  end
+
+  def handle_call({:create_folder, name}, _from, st) do
+    with {:ok, name} <- FolderName.normalize(name),
+         :error <- Map.fetch(st.folders, name),
+         missing = Enum.reject(FolderName.parents(name), &Map.has_key?(st.folders, &1)),
+         {:ok, :ok} <-
+           tx(st, fn ->
+             Commands.create_folders(st.repo, st.tenant_id, st.account_id, missing ++ [name])
+           end) do
+      reply(:ok, track_recent(%{st | folders: load_folders(st.repo, st.account_id)}))
+    else
+      {:ok, _existing} -> reply({:error, :already_exists}, st)
+      error -> reply(error, st)
+    end
+  end
+
+  def handle_call({:set_subscribed, name, on?}, _from, st) do
+    with {:ok, f} <- folder(st, name),
+         {:ok, :ok} <- tx(st, fn -> Commands.set_subscribed(st.repo, f.id, on?) end) do
+      reply(:ok, st)
+    else
+      error -> reply(error, st)
+    end
+  end
+
+  def handle_call({:delete_folder, name}, _from, st) do
+    with {:ok, name} <- FolderName.normalize(name),
+         {:ok, f} <- folder(st, name),
+         :ok <- if(name == "INBOX", do: {:error, :inbox}, else: :ok),
+         :ok <- if(has_children?(st, name), do: {:error, :has_children}, else: :ok),
+         {:ok, :ok} <- tx(st, fn -> Commands.delete_folder(st.repo, f.id) end) do
+      notify(st, f.id, :deleted)
+      st = drop_cache(%{st | folders: load_folders(st.repo, st.account_id)}, f.id)
+      reply(:ok, st)
+    else
+      {:error, :invalid_name} -> reply({:error, :no_such_folder}, st)
+      error -> reply(error, st)
+    end
+  end
+
+  def handle_call({:rename_folder, old, new}, _from, st) do
+    with {:ok, old} <- FolderName.normalize(old),
+         {:ok, _} <- folder(st, old),
+         {:ok, new} <- FolderName.normalize(new),
+         :ok <- if(old == "INBOX", do: {:error, :inbox}, else: :ok),
+         :ok <- if(Map.has_key?(st.folders, new), do: {:error, :already_exists}, else: :ok),
+         :ok <- if(FolderName.within?(new, old), do: {:error, :into_itself}, else: :ok),
+         missing = Enum.reject(FolderName.parents(new), &Map.has_key?(st.folders, &1)),
+         {:ok, renamed} <-
+           tx(st, fn ->
+             if missing != [],
+               do: Commands.create_folders(st.repo, st.tenant_id, st.account_id, missing)
+
+             Commands.rename_folder(st.repo, st.account_id, old, new)
+           end) do
+      st = track_recent(%{st | folders: load_folders(st.repo, st.account_id)})
+
+      for {id, name} <- renamed, do: notify(st, id, {:renamed, st.folders[name]})
+      reply(:ok, st)
     else
       error -> reply(error, st)
     end
@@ -294,7 +428,7 @@ defmodule Mailstore.Mailbox.AccountServer do
   def handle_cast(:reload, st) do
     st = %{st | folders: load_folders(st.repo, st.account_id), cache: %{}}
 
-    for {pid, {fid, _ref}} <- st.subs do
+    for {pid, {fid, _ref, _rw}} <- st.subs do
       case Enum.find(Map.values(st.folders), &(&1.id == fid)) do
         nil -> :ok
         view -> send(pid, {:mailstore, fid, {:reload, view}})
@@ -307,7 +441,7 @@ defmodule Mailstore.Mailbox.AccountServer do
   @impl true
   def handle_info({:DOWN, ref, :process, pid, _reason}, st) do
     case st.subs do
-      %{^pid => {_fid, ^ref}} -> noreply(%{st | subs: Map.delete(st.subs, pid)})
+      %{^pid => {_fid, ^ref, _rw}} -> noreply(%{st | subs: Map.delete(st.subs, pid)})
       _ -> noreply(st)
     end
   end
@@ -335,7 +469,8 @@ defmodule Mailstore.Mailbox.AccountServer do
       _ ->
         cached = %{
           uids: UidMap.from_ranges(st.repo.all(Queries.uid_ranges(fid))),
-          unseen: UidMap.from_ranges(st.repo.all(Queries.unseen_uid_ranges(fid)))
+          unseen: UidMap.from_ranges(st.repo.all(Queries.unseen_uid_ranges(fid))),
+          keywords: MapSet.new(st.repo.all(Queries.folder_keywords(fid)))
         }
 
         {:ok, cached, put_in(st.cache[fid], cached)}
@@ -383,8 +518,16 @@ defmodule Mailstore.Mailbox.AccountServer do
     end)
   end
 
-  # INBOX is case-insensitive in IMAP; other names are case-sensitive.
-  defp norm(name), do: if(String.upcase(name) == "INBOX", do: "INBOX", else: name)
+  # INBOX is case-insensitive in IMAP (also as a prefix); other names are case-sensitive.
+  defp norm(name) do
+    case FolderName.normalize(name) do
+      {:ok, name} -> name
+      {:error, _} -> name
+    end
+  end
+
+  defp has_children?(st, name),
+    do: Enum.any?(Map.keys(st.folders), &(&1 != name and FolderName.within?(&1, name)))
 
   defp folder(st, name) do
     case Map.fetch(st.folders, norm(name)) do
@@ -399,13 +542,49 @@ defmodule Mailstore.Mailbox.AccountServer do
     do: update_in(st.folders[norm(name)], &Map.merge(&1, counters))
 
   defp notify(st, folder_id, event) do
-    for {pid, {^folder_id, _ref}} <- st.subs, do: send(pid, {:mailstore, folder_id, event})
+    for {pid, {^folder_id, _ref, _rw}} <- st.subs, do: send(pid, {:mailstore, folder_id, event})
     :ok
   end
 
+  # New messages: one read-write session with the folder selected gets them as \\Recent;
+  # without one they stay unclaimed for the next SELECT.
+  defp notify_exists(st, folder_id, uids, view) do
+    claimer =
+      Enum.find_value(st.subs, fn {pid, {fid, _ref, rw}} -> (fid == folder_id and rw) && pid end)
+
+    for {pid, {^folder_id, _ref, _rw}} <- st.subs do
+      event = if pid == claimer, do: {:exists, uids, view, :recent}, else: {:exists, uids, view}
+      send(pid, {:mailstore, folder_id, event})
+    end
+
+    if claimer, do: put_in(st.recent_from[folder_id], view.uidnext), else: st
+  end
+
+  defp recent_from(st, f), do: Map.get(st.recent_from, f.id, f.uidnext)
+
+  # Messages that arrived before the actor started are not recent; neither are those
+  # of a folder created later until something arrives.
+  defp track_recent(st) do
+    recent =
+      Enum.reduce(Map.values(st.folders), st.recent_from, fn f, acc ->
+        Map.put_new(acc, f.id, f.uidnext)
+      end)
+
+    %{st | recent_from: recent}
+  end
+
+  # STATUS RECENT: unclaimed messages. Without the folder state in memory, everything
+  # appended since the actor started (expunges need a selected session, which loads it).
+  defp recent_count(st, f), do: recent_in(Map.get(st.cache, f.id), recent_from(st, f), f)
+
+  defp recent_in(nil, from, f), do: max(f.uidnext - from, 0)
+
+  defp recent_in(c, from, _f),
+    do: length(UidMap.uids_between(c.uids, from, UidMap.max_uid(c.uids)))
+
   defp drop_sub(st, pid) do
     case Map.pop(st.subs, pid) do
-      {{_fid, ref}, subs} ->
+      {{_fid, ref, _rw}, subs} ->
         Process.demonitor(ref, [:flush])
         %{st | subs: subs}
 

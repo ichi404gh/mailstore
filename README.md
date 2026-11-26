@@ -14,7 +14,7 @@
   - Актор аккаунта: выдаёт UID и MODSEQ, рассылает изменения сессиям.
   - Доставка с копией в мастер-инбокс, redirect и внешней пересылкой.
 - **IMAP4rev1-сервер.**
-  - Команды: LOGIN, LIST, STATUS, SELECT/EXAMINE, APPEND, FETCH, STORE, SEARCH, COPY/MOVE, EXPUNGE, IDLE (и UID-варианты), UIDPLUS.
+  - Команды: LOGIN, LIST/LSUB, STATUS, SELECT/EXAMINE, CREATE/DELETE/RENAME, SUBSCRIBE/UNSUBSCRIBE, APPEND, FETCH, STORE, SEARCH, COPY/MOVE, EXPUNGE, IDLE (и UID-варианты), UIDPLUS.
   - Уведомления об изменениях только там, где их разрешает протокол.
   - Быстрый SEARCH: по UID — без БД, UNSEEN — из памяти актора.
   - SELECT и UNSEEN из памяти актора: состояние открытых папок держит актор аккаунта, Postgres в этих командах не участвует (SELECT 220 + 140 → 99 мкс, UNSEEN 120 + 80 → 92 мкс, см. [bench/README.md](bench/README.md#select-и-unseen-из-памяти-актора)).
@@ -45,7 +45,11 @@
   - доставка стоит одинаково, ~1,6 мс CPU на письмо (сервер плюс Postgres);
   - кеша логинов у Stalwart нет, но с хешами SHA512-CRYPT из Dovecot вход стоит 1,2 мс;
   - модель хранения не подходит без доработок: все ноды на одном хранилище данных, шардирования данных по tenant нет ни в одной редакции, удаление по сроку — только Trash и Junk, приёма из Kafka нет.
-- 78 тестов, включая сквозной через Python imaplib.
+- **Совместимость** (`compat/`, итоги в [compat/README.md](compat/README.md)):
+  - Dovecot `imaptest`: 0 ошибок в скриптовых тестах и в 60-секундном стрессе;
+  - миграция из Dovecot через imapsync: 375 писем, сверка каждого письма с Dovecot, включая ENVELOPE и BODYSTRUCTURE, — 0 расхождений;
+  - mbsync, OfflineIMAP и imapflow проходят двустороннюю синхронизацию и сценарий сервиса.
+- 86 тестов, включая сквозной через Python imaplib.
 
 ### Решения
 
@@ -66,7 +70,7 @@
 2. **Шарды в прототипе:** таблица `shards`, dynamic repos, перенос tenant, тест на двух шардах.
 3. **Холодный слой тел** (закрытые недели → объектное хранилище), классы хранения, словари zstd.
 4. **Консьюмер очереди входящих** (Broadway); group commit в акторе.
-5. **Протокол и совместимость:** CONDSTORE/QRESYNC, CREATE/RENAME/DELETE папок; Dovecot `imaptest`; Thunderbird, Apple Mail.
+5. **Протокол и совместимость:** почтовые программы с GUI (Thunderbird, Apple Mail, Outlook, мобильные); CONDSTORE/QRESYNC; ESEARCH, SORT/THREAD для веб-клиентов.
 6. **Нагрузка на Linux:** 100 тыс. сессий, CPU и задержка TLS-рукопожатий, сценарий burst, память TLS в BEAM против HAProxy.
 7. **Цена раунда команды:** NOOP стоит 75 мкс CPU против 30 у Stalwart.
 
@@ -80,7 +84,7 @@
 
 ```bash
 docker compose up -d postgres            # Postgres 17 на :55432
-mix test                                 # 78 тестов
+mix test                                 # 86 тестов
 deploy/haproxy/gen-cert.sh && docker compose up -d haproxy   # если нужен TLS на :10993
 ```
 
@@ -91,7 +95,7 @@ deploy/haproxy/gen-cert.sh && docker compose up -d haproxy   # если нуже
 ```bash
 docker compose up -d          # Postgres 17 на localhost:55432
 mix setup                     # deps + создание БД + миграции
-mix test                      # 78 тестов, включая сквозной через Python imaplib
+mix test                      # 86 тестов, включая сквозной через Python imaplib
 mix run priv/scripts/bench_delivery.exs -- --accounts 2000 --messages 50000 --concurrency 64
 mix run --no-halt             # IMAP на 127.0.0.1:1143 (без TLS: TLS снимается на HAProxy)
 ```
@@ -121,6 +125,8 @@ docker compose up -d haproxy  # TLS на localhost:10993 → BEAM :1144 (PROXY p
 lib/mailstore/
 ├── core/                      чистые функции: без БД и процессов
 │   ├── headers.ex             разбор заголовков RFC 5322
+│   ├── address.ex             списки адресов RFC 5322 для ENVELOPE: группы, комментарии, маршруты
+│   ├── folder_name.ex         имена папок: разделитель, правила INBOX, проверка
 │   ├── mime.ex                дерево MIME-частей со смещениями (BODYSTRUCTURE, BODY[n.m])
 │   ├── new_message.ex         письмо, подготовленное к записи (разобрано один раз)
 │   ├── flags.ex               флаги IMAP ↔ битовая маска
@@ -163,7 +169,10 @@ lib/mailstore/
 
 bench/                         нагрузочные тесты, не входят в сервер (см. bench/README.md)
 ├── seed.exs                   заливка аккаунтов
-└── loadgen/                   отдельный Mix-проект: генератор IMAP-сессий
+├── loadgen/                   отдельный Mix-проект: генератор IMAP-сессий
+└── stalwart/                  стенд сравнения со Stalwart
+
+compat/                        совместимость: imaptest, миграция из Dovecot, настоящие клиенты (см. compat/README.md)
 ```
 
 | Контекст | Публичный API | Внутреннее устройство |
@@ -184,7 +193,8 @@ bench/                         нагрузочные тесты, не вход�
 **Поддерживается** (по CAPABILITY): `IMAP4rev1 LITERAL+ IDLE UIDPLUS MOVE NAMESPACE ID ENABLE UNSELECT SPECIAL-USE CHILDREN`.
 
 - Сессия: CAPABILITY, NOOP, LOGOUT, ID, LOGIN.
-- Папки: LIST, LSUB, STATUS, SELECT и EXAMINE (все из памяти актора), SUBSCRIBE/UNSUBSCRIBE (no-op), NAMESPACE.
+- Папки: LIST (с `\HasChildren`/`\HasNoChildren` и special-use), LSUB, STATUS, SELECT и EXAMINE (все из памяти актора), CREATE (с недостающими родителями), DELETE (папку с детьми — нет, как в Dovecot), RENAME (с поддеревом; UID и UIDVALIDITY сохраняются), SUBSCRIBE/UNSUBSCRIBE, NAMESPACE. Разделитель `/`, имена в modified UTF-7 хранятся как есть. UIDVALIDITY новой папки берётся из последовательности Postgres, поэтому пересозданная папка никогда не получает прежний.
+- `\Recent` по RFC 3501: письмо недавнее ровно для одной сессии, открывшей папку на запись (EXAMINE его не забирает); состояние в памяти актора. Ключевые слова, используемые в папке, перечислены в `* FLAGS`, новое объявляется до первого FETCH с ним.
 - Письма: APPEND (APPENDUID), FETCH / UID FETCH, STORE / UID STORE (включая .SILENT), SEARCH / UID SEARCH, COPY / MOVE (COPYUID), EXPUNGE / UID EXPUNGE, CLOSE, UNSELECT, CHECK, IDLE.
 - FETCH: UID, FLAGS, INTERNALDATE, RFC822.SIZE, ENVELOPE, BODY, BODYSTRUCTURE, RFC822[.HEADER|.TEXT], макросы ALL/FAST/FULL, BODY[] и BODY.PEEK[] с секциями HEADER, TEXT, HEADER.FIELDS[.NOT], номерами частей (`1.2`), их MIME/HEADER/TEXT и частичной выдачей `<n.m>`. Чтение без PEEK ставит `\Seen` и сообщает новые флаги.
 - MIME (`Core.Mime`): дерево частей разбирается при доставке и хранится в `messages.bodystructure` (jsonb, короткие ключи: ~100 байт у text/plain, ~300 у multipart/alternative). Разбор стоит ~6 мкс на простое письмо и ~20 мкс на multipart/alternative. BODYSTRUCTURE отдаётся из метаданных одним запросом, секции частей режутся по смещениям из дерева. Формат ответа как у Dovecot: типы в нижнем регистре, параметры как в письме, продолжения RFC 2231 склеены. Защита от враждебных писем: глубина до 32, до 1 000 частей (остальные остаются внутри последней). Строки без дерева (записанные до парсера) получают его разбором тела при FETCH. Проверено сверкой с пакетом `email` из Python на 200 сгенерированных письмах (751 часть).
@@ -198,7 +208,7 @@ bench/                         нагрузочные тесты, не вход�
 
 **Directory в ETS** (`Directory.Cache`). Поиск получателя, LOGIN и правила маршрутизации идут без базы. Изменённые строки опрашиваются раз в секунду, полная перезагрузка раз в 10 минут убирает удалённые. Записи через `Directory` применяются сразу. Успешные логины кешируются на час как HMAC от хеша пароля и самого пароля; смена пароля их сбрасывает. На ~860 тыс. аккаунтов: ~530 MB на ноду, поиск ~6,5 мкс, полная загрузка 5–9 с.
 
-**Пока нет:** BINARY (RFC 3516, декодирование base64/QP на сервере), поиск BODY/TEXT по декодированному тексту частей (сейчас — по сырым байтам), CREATE / DELETE / RENAME папок, AUTHENTICATE, CONDSTORE / QRESYNC в протоколе (в хранилище MODSEQ уже есть), имена папок в modified UTF-7.
+**Пока нет:** BINARY (RFC 3516, декодирование base64/QP на сервере), поиск BODY/TEXT по декодированному тексту частей (сейчас — по сырым байтам), AUTHENTICATE, CONDSTORE / QRESYNC в протоколе (в хранилище MODSEQ уже есть), ESEARCH, SORT, THREAD, LIST-EXTENDED.
 
 ## Наблюдаемость и нагрузка
 

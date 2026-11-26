@@ -81,6 +81,123 @@ defmodule Mailstore.Imap.SessionTest do
       {out, _} = cmd(login(), "a1 SELECT Nope")
       assert out =~ "a1 NO"
     end
+
+    test "CREATE with parents, LIST children, RENAME subtree, DELETE rules" do
+      s = login()
+      {out, s} = cmd(s, "a1 CREATE Work/2026/Q4/")
+      assert out =~ "a1 OK"
+      {out, s} = cmd(s, "a2 CREATE Work")
+      assert out =~ "a2 NO [ALREADYEXISTS]"
+      {out, s} = cmd(s, "a3 CREATE inbox")
+      assert out =~ "a3 NO [ALREADYEXISTS]"
+      {out, s} = cmd(s, ~s(a4 CREATE "bad*name"))
+      assert out =~ "a4 NO"
+
+      {out, s} = cmd(s, ~s(a5 LIST "" "Work/%"))
+      assert out == ~s{* LIST (\\HasChildren) "/" "Work/2026"\r\na5 OK LIST completed\r\n}
+
+      {out, s} = cmd(s, "a6 DELETE Work")
+      assert out =~ "a6 NO [HASCHILDREN]"
+      {out, s} = cmd(s, "a7 RENAME Work Archive/Work")
+      assert out =~ "a7 OK"
+      {out, s} = cmd(s, ~s(a8 LIST "" "*Q4"))
+      assert out =~ ~s{"Archive/Work/2026/Q4"} and not (out =~ ~s{"Work/2026/Q4"})
+      {out, s} = cmd(s, "a9 RENAME Archive Archive/Inside")
+      assert out =~ "a9 NO [CANNOT]"
+
+      for {tag, name} <- [b1: "Archive/Work/2026/Q4", b2: "Archive/Work/2026", b3: "Archive/Work"],
+          do: assert(elem(cmd(s, "#{tag} DELETE #{name}"), 0) =~ "#{tag} OK")
+
+      {out, _} = cmd(s, "c1 DELETE INBOX")
+      assert out =~ "c1 NO [CANNOT]"
+    end
+
+    test "a folder created again under the same name gets a new UIDVALIDITY" do
+      s = login()
+      {_, s} = cmd(s, "a1 CREATE Box")
+      {out, s} = cmd(s, "a2 STATUS Box (UIDVALIDITY)")
+      [_, v1] = Regex.run(~r/UIDVALIDITY (\d+)/, out)
+      {_, s} = cmd(s, "a3 DELETE Box")
+      {_, s} = cmd(s, "a4 CREATE Box")
+      {out, _} = cmd(s, "a5 STATUS Box (UIDVALIDITY)")
+      [_, v2] = Regex.run(~r/UIDVALIDITY (\d+)/, out)
+      assert v1 != v2
+    end
+
+    test "LSUB shows subscribed folders; an unsubscribed parent is \\Noselect" do
+      s = login()
+      {_, s} = cmd(s, "a1 CREATE P/child")
+      {_, s} = cmd(s, ~s(a2 LSUB "" "P*"))
+      {out, s} = cmd(s, ~s(a3 LSUB "" "P*"))
+      assert out == "a3 OK LSUB completed\r\n"
+
+      {out, s} = cmd(s, "a4 SUBSCRIBE P/child")
+      assert out =~ "a4 OK"
+      {out, s} = cmd(s, ~s(a5 LSUB "" "%"))
+      assert out =~ ~s{* LSUB (\\Noselect) "/" "P"} and out =~ ~s{* LSUB () "/" "INBOX"}
+      {out, s} = cmd(s, ~s(a6 LSUB "" "P/%"))
+      assert out =~ ~s{* LSUB () "/" "P/child"}
+
+      {out, s} = cmd(s, "a7 UNSUBSCRIBE P/child")
+      assert out =~ "a7 OK"
+      {out, _} = cmd(s, "a8 SUBSCRIBE Nope")
+      assert out =~ "a8 NO [NONEXISTENT]"
+    end
+
+    test "another session renaming or deleting the selected folder" do
+      {_, other} = cmd(login(), "o1 CREATE Shared")
+      {_, s} = cmd(login(), "s1 SELECT Shared")
+
+      {_, _} = cmd(other, "o2 RENAME Shared Renamed")
+      # The rename applies at once: the next command uses the new name.
+      {out, s} = cmd(s, "s2 STORE 1:* +FLAGS (\\Seen)")
+      assert out =~ "s2 OK"
+      assert s.folder.name == "Renamed"
+
+      {_, _} = cmd(other, "o3 DELETE Renamed")
+      {out, s} = cmd(s, "s3 NOOP")
+      assert out =~ "* BYE Selected folder was deleted" and Session.logout?(s)
+    end
+  end
+
+  describe "\\Recent and keywords" do
+    test "new mail is \\Recent for one read-write session; EXAMINE does not take it" do
+      deliver()
+      deliver()
+      {out, s1} = cmd(login(), "e1 EXAMINE INBOX")
+      assert out =~ "* 2 RECENT"
+      {out, _} = cmd(s1, "e2 STATUS INBOX (RECENT)")
+      assert out =~ "RECENT 2"
+
+      {out, s2} = cmd(login(), "s1 SELECT INBOX")
+      assert out =~ "* 2 RECENT"
+      {out, s2} = cmd(s2, "s2 SEARCH RECENT")
+      assert out =~ "* SEARCH 1 2\r\n"
+      {out, _} = cmd(login(), "s3 SELECT INBOX")
+      assert out =~ "* 0 RECENT"
+
+      # Arriving while selected: EXISTS and RECENT for the read-write session.
+      deliver()
+      {out, s2} = cmd(s2, "s4 NOOP")
+      assert out =~ "* 3 EXISTS\r\n* 3 RECENT\r\n"
+      {out, _} = cmd(s2, "s5 FETCH 3 FLAGS")
+      assert out =~ "FLAGS (\\Recent)"
+    end
+
+    test "keywords in use are listed in FLAGS, and a new one is announced first" do
+      deliver()
+      {out, s} = cmd(login(), "a1 SELECT INBOX")
+      assert out =~ "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n"
+
+      {out, s} = cmd(s, "a2 STORE 1 +FLAGS ($Work)")
+
+      assert out =~
+               ~r/\* FLAGS \(.*\$Work\)\r\n\* OK \[PERMANENTFLAGS \(.*\$Work \\\*\)\].*\* 1 FETCH/s
+
+      {out, _} = cmd(login(), "b1 SELECT INBOX")
+      assert out =~ "\\Draft $Work)"
+      assert s.keywords == MapSet.new(["$Work"])
+    end
   end
 
   describe "fetch" do
@@ -89,14 +206,14 @@ defmodule Mailstore.Imap.SessionTest do
       s = selected()
 
       {out, s} = cmd(s, "a1 FETCH 1 (FLAGS BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
-      assert out =~ "* 1 FETCH (FLAGS () BODY[HEADER.FIELDS (SUBJECT)] {"
+      assert out =~ "* 1 FETCH (FLAGS (\\Recent) BODY[HEADER.FIELDS (SUBJECT)] {"
       assert out =~ "Subject: hello\r\n\r\n)"
 
       {out, s} = cmd(s, "a2 UID FETCH 1 (BODY[TEXT]<0.5>)")
-      assert out =~ "* 1 FETCH (UID 1 BODY[TEXT]<0> {5}\r\nHi Bo FLAGS (\\Seen))"
+      assert out =~ "* 1 FETCH (UID 1 BODY[TEXT]<0> {5}\r\nHi Bo FLAGS (\\Seen \\Recent))"
 
       {out, _} = cmd(s, "a3 FETCH 1 FLAGS")
-      assert out =~ "* 1 FETCH (FLAGS (\\Seen))"
+      assert out =~ "* 1 FETCH (FLAGS (\\Seen \\Recent))"
     end
 
     test "ENVELOPE, size, internal date" do
@@ -125,20 +242,20 @@ defmodule Mailstore.Imap.SessionTest do
       assert n == 1
 
       assert out =~
-               ~s{* 1 FETCH (BODYSTRUCTURE (("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 5 1 } <>
-                 ~s{NIL NIL NIL NIL)("text" "html" ("charset" "us-ascii") NIL NIL "7bit" 9 1 } <>
+               ~s{* 1 FETCH (BODYSTRUCTURE (("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 5 0 } <>
+                 ~s{NIL NIL NIL NIL)("text" "html" ("charset" "us-ascii") NIL NIL "7bit" 9 0 } <>
                  ~s{NIL ("inline" NIL) NIL NIL) "mixed" ("boundary" "b") NIL NIL NIL))}
 
       {out, s} = cmd(s, "a2 FETCH 1 (BODY.PEEK[2] BODY.PEEK[2.MIME] BODY.PEEK[1]<1.3> BODY[9])")
       assert out =~ "BODY[2] {9}\r\n<b>hi</b> "
       assert out =~ "BODY[2.MIME] {56}\r\nContent-Type: text/html\r\n"
       assert out =~ "BODY[1]<1> {3}\r\nell "
-      assert out =~ "BODY[9] NIL FLAGS (\\Seen))"
+      assert out =~ "BODY[9] NIL FLAGS (\\Seen \\Recent))"
 
       {out, _} = cmd(s, "a3 FETCH 1 FULL")
 
       assert out =~
-               ~r/ENVELOPE \(.*\) BODY \(\("text" "plain" .* 5 1\)\("text" "html" .* 9 1\) "mixed"\)\)/
+               ~r/ENVELOPE \(.*\) BODY \(\("text" "plain" .* 5 0\)\("text" "html" .* 9 0\) "mixed"\)\)/
     end
 
     test "a row stored before MIME parsing gets its tree from the body" do
@@ -161,7 +278,7 @@ defmodule Mailstore.Imap.SessionTest do
     test "STORE answers with new flags; SEARCH by flags, headers, text, uid" do
       s = selected()
       {out, s} = cmd(s, "a1 STORE 1 +FLAGS (\\Flagged)")
-      assert out =~ "* 1 FETCH (FLAGS (\\Flagged))"
+      assert out =~ "* 1 FETCH (FLAGS (\\Flagged \\Recent))"
 
       {out, s} = cmd(s, "a2 STORE 2 +FLAGS.SILENT (\\Seen)")
       refute out =~ "FETCH"
@@ -276,7 +393,7 @@ defmodule Mailstore.Imap.SessionTest do
       s = selected()
       deliver(subject: "late")
       {out, _} = cmd(s, "a1 UID SEARCH UID 5:*")
-      assert out =~ "* 6 EXISTS\r\n* SEARCH 5 6\r\n"
+      assert out =~ "* 6 EXISTS\r\n* 6 RECENT\r\n* SEARCH 5 6\r\n"
     end
   end
 
@@ -291,10 +408,10 @@ defmodule Mailstore.Imap.SessionTest do
           "a1 APPEND INBOX (\\Seen) \" 5-Nov-2026 12:00:00 +0000\" {#{byte_size(raw)}}\r\n" <> raw
         )
 
-      assert out =~ ~r/\* 1 EXISTS\r\na1 OK \[APPENDUID \d+ 1\] APPEND completed/
+      assert out =~ ~r/\* 1 EXISTS\r\n\* 1 RECENT\r\na1 OK \[APPENDUID \d+ 1\] APPEND completed/
 
       {out, _} = cmd(s, "a2 FETCH 1 (FLAGS INTERNALDATE)")
-      assert out =~ ~s{FLAGS (\\Seen) INTERNALDATE "05-Nov-2026 12:00:00 +0000"}
+      assert out =~ ~s{FLAGS (\\Seen \\Recent) INTERNALDATE "05-Nov-2026 12:00:00 +0000"}
     end
 
     test "COPY and MOVE report COPYUID; MOVE expunges in this session" do
@@ -332,7 +449,7 @@ defmodule Mailstore.Imap.SessionTest do
       deliver(subject: "while idle")
       assert_receive {:mailstore, _, _} = push
       {out, s} = Session.handle_push(push, s)
-      assert IO.iodata_to_binary(out) == "* 1 EXISTS\r\n"
+      assert IO.iodata_to_binary(out) == "* 1 EXISTS\r\n* 1 RECENT\r\n"
 
       {out, _} = cmd(s, "DONE")
       assert out == "i1 OK IDLE terminated\r\n"

@@ -33,7 +33,9 @@ defmodule Mailstore.Mailbox do
   @doc "Create the standard folder set for a new account. Idempotent."
   def create_default_folders(%{id: account_id, tenant_id: tenant_id}) do
     now = DateTime.utc_now()
-    uidvalidity = System.os_time(:second)
+    repo = Shards.repo(tenant_id)
+    # From the sequence, like every folder: see Commands.create_folders/4.
+    %{rows: [[uidvalidity]]} = repo.query!("SELECT nextval('folder_uidvalidity')")
 
     rows =
       for {name, special_use} <- @default_folders do
@@ -48,7 +50,7 @@ defmodule Mailstore.Mailbox do
         }
       end
 
-    Shards.repo(tenant_id).insert_all(Folder, rows, on_conflict: :nothing)
+    repo.insert_all(Folder, rows, on_conflict: :nothing)
     :ok
   end
 
@@ -56,10 +58,11 @@ defmodule Mailstore.Mailbox do
 
   @doc """
   Select a folder: {:ok, actor_pid, view}; deltas arrive as `{:mailstore, folder_id, event}`.
-  The view carries a snapshot from the actor's memory: `:uids` (`Mailstore.Core.UidMap`)
-  and `:first_unseen`.
+  The view carries a snapshot from the actor's memory: `:uids` (`Mailstore.Core.UidMap`),
+  `:first_unseen`, `:keywords`, `:recent`. `read_only: true` (EXAMINE) does not claim
+  \\Recent messages.
   """
-  defdelegate subscribe(account_id, folder), to: AccountServer
+  defdelegate subscribe(account_id, folder, opts \\ []), to: AccountServer
   defdelegate unsubscribe(account_id), to: AccountServer
 
   @doc "SELECT/STATUS data from the actor's memory, no database round trip."
@@ -75,6 +78,18 @@ defmodule Mailstore.Mailbox do
   defdelegate store_flags(account_id, folder, uids, op, flags), to: AccountServer
 
   defdelegate expunge(account_id, folder, uids \\ :all), to: AccountServer
+
+  @doc "CREATE with missing parents: :ok | {:error, :invalid_name | :already_exists}."
+  defdelegate create_folder(account_id, name), to: AccountServer
+
+  @doc "DELETE: :ok | {:error, :no_such_folder | :inbox | :has_children}."
+  defdelegate delete_folder(account_id, name), to: AccountServer
+
+  @doc "SUBSCRIBE / UNSUBSCRIBE: :ok | {:error, :no_such_folder}."
+  defdelegate set_subscribed(account_id, name, on?), to: AccountServer
+
+  @doc "RENAME with children: :ok | {:error, reason} (see `AccountServer.rename_folder/3`)."
+  defdelegate rename_folder(account_id, old, new), to: AccountServer
 
   @doc "Returns {:ok, %{uidvalidity, mapping: [{src_uid, dst_uid}]}} (for COPYUID)."
   defdelegate copy(account_id, from, uids, to), to: AccountServer

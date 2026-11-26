@@ -261,6 +261,61 @@ defmodule Mailstore.Mailbox.Commands do
     end
   end
 
+  ## Folders
+
+  @doc """
+  CREATE: insert folders (parents first). UIDVALIDITY comes from the
+  `folder_uidvalidity` sequence, so a name created again never reuses an old value.
+  New folders are not subscribed: clients subscribe themselves (as with Dovecot).
+  """
+  def create_folders(repo, tenant_id, account_id, names) when names != [] do
+    repo.query!(
+      """
+      INSERT INTO folders (tenant_id, account_id, name, uidvalidity, subscribed, inserted_at, updated_at)
+      SELECT $1, $2, n, nextval('folder_uidvalidity'), false, now() AT TIME ZONE 'UTC', now() AT TIME ZONE 'UTC'
+      FROM unnest($3::text[]) WITH ORDINALITY AS t(n, i)
+      ORDER BY i
+      """,
+      [tenant_id, account_id, names]
+    )
+
+    :ok
+  end
+
+  @doc "SUBSCRIBE / UNSUBSCRIBE. Subscriptions belong to existing folders only."
+  def set_subscribed(repo, folder_id, on?) do
+    repo.query!("UPDATE folders SET subscribed = $2 WHERE id = $1", [folder_id, on?])
+    :ok
+  end
+
+  @doc "DELETE: the folder with all its messages, bodies and expunge log."
+  def delete_folder(repo, folder_id) do
+    for table <- ["message_bodies", "messages", "vanished"],
+        do: repo.query!("DELETE FROM #{table} WHERE folder_id = $1", [folder_id])
+
+    repo.query!("DELETE FROM folders WHERE id = $1", [folder_id])
+    :ok
+  end
+
+  @doc """
+  RENAME: the folder and everything inside it move under the new name; ids, UIDs and
+  UIDVALIDITY stay. Returns [{folder_id, new_name}].
+  """
+  def rename_folder(repo, account_id, old, new) do
+    %{rows: rows} =
+      repo.query!(
+        """
+        UPDATE folders
+        SET name = $3 || substr(name, length($2) + 1), updated_at = now() AT TIME ZONE 'UTC'
+        WHERE account_id = $1 AND (name = $2 OR starts_with(name, $2 || '/'))
+        RETURNING id, name
+        """,
+        [account_id, old, new]
+      )
+
+    Enum.map(rows, fn [id, name] -> {id, name} end)
+  end
+
   defp lock_next_modseq(repo, folder_id) do
     %{rows: [[next]]} =
       repo.query!("SELECT highest_modseq + 1 FROM folders WHERE id = $1 FOR UPDATE", [folder_id])

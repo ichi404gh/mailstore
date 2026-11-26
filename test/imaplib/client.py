@@ -124,7 +124,7 @@ typ, data = M.uid("FETCH", "1", "(BODYSTRUCTURE)")
 # The non-ASCII filename comes as a literal, so imaplib splits the line around it.
 flat = b"".join(d if isinstance(d, bytes) else d[0] + d[1] for d in data)
 check(typ == "OK" and flat.count(b"(") == flat.count(b")"), "bodystructure balanced", data)
-check(b'("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 12 1 ' in flat, "text part", data)
+check(b'("text" "plain" ("charset" "utf-8") NIL NIL "7bit" 12 0 ' in flat, "text part", data)
 check(b'"base64" 12 NIL ("attachment" ("filename" {' in flat, "attachment part", data)
 check("отчёт.pdf".encode() in flat and b'"mixed" ("boundary" "xyz")' in flat, "filename", data)
 typ, data = M.uid("FETCH", "1", "(BODY.PEEK[2] BODY.PEEK[1.MIME])")

@@ -21,12 +21,11 @@ defmodule Mailstore.Imap.Session do
   require Logger
 
   alias Mailstore.{Directory, Mailbox}
-  alias Mailstore.Core.{Flags, NewMessage, UidMap}
+  alias Mailstore.Core.{Flags, FolderName, NewMessage, UidMap}
   alias Mailstore.Imap.{Fetch, Format, Parser, Search, SequenceSet}
 
   @capabilities "IMAP4rev1 LITERAL+ IDLE UIDPLUS MOVE NAMESPACE ID ENABLE UNSELECT SPECIAL-USE CHILDREN"
-  @system_flags "(\\Answered \\Flagged \\Deleted \\Seen \\Draft)"
-  @permanent_flags "(\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)"
+  @system_flags ~w(\\Answered \\Flagged \\Deleted \\Seen \\Draft)
 
   @any ~w(CAPABILITY NOOP LOGOUT ID)
   @not_authenticated ~w(LOGIN AUTHENTICATE STARTTLS)
@@ -44,7 +43,10 @@ defmodule Mailstore.Imap.Session do
             highest_modseq: 0,
             own_modseqs: MapSet.new(),
             pending: [],
-            idle_tag: nil
+            idle_tag: nil,
+            # Keywords announced in FLAGS, and UIDs that are \\Recent in this session.
+            keywords: MapSet.new(),
+            recent: MapSet.new()
 
   @type t :: %__MODULE__{}
 
@@ -66,6 +68,34 @@ defmodule Mailstore.Imap.Session do
   end
 
   def handle_command(command, s) do
+    case folder_changes(s) do
+      {:bye, out, s} -> {out, s}
+      {:ok, s} -> run_command(command, s)
+    end
+  end
+
+  # A rename or delete of the selected folder that is already waiting in the process
+  # mailbox takes effect before the command, which would otherwise use the old name.
+  defp folder_changes(%{state: :selected} = s) do
+    s = drain(s)
+    {now, later} = Enum.split_with(s.pending, &(&1 == :deleted or match?({:renamed, _}, &1)))
+    s = %{s | pending: later}
+
+    Enum.reduce(now, {:ok, s}, fn
+      _event, {:bye, _, _} = done ->
+        done
+
+      event, {:ok, s} ->
+        case apply_event(event, s) do
+          {[], s} -> {:ok, s}
+          {out, s} -> {:bye, out, s}
+        end
+    end)
+  end
+
+  defp folder_changes(s), do: {:ok, s}
+
+  defp run_command(command, s) do
     case Parser.parse(command) do
       {:ok, tag, cmd, args} ->
         {untagged, result, s} =
@@ -165,11 +195,47 @@ defmodule Mailstore.Imap.Session do
   defp command("ENABLE", _, s), do: {["* ENABLED\r\n"], {:ok, "ENABLE completed"}, s}
   defp command("IDLE", _, s), do: {[], :idle, s}
 
-  defp command(cmd, _, s) when cmd in ["SUBSCRIBE", "UNSUBSCRIBE"],
-    do: {[], {:ok, "#{cmd} completed"}, s}
+  defp command(cmd, [name], s) when cmd in ["SUBSCRIBE", "UNSUBSCRIBE"] do
+    with {:ok, name} <- astring(name),
+         :ok <- Mailbox.set_subscribed(s.account.id, name, cmd == "SUBSCRIBE") do
+      {[], {:ok, "#{cmd} completed"}, s}
+    else
+      error -> folder_error(error, s)
+    end
+  end
 
-  defp command(cmd, _, s) when cmd in ["CREATE", "DELETE", "RENAME"],
-    do: {[], {:no, "Folder management is not implemented yet"}, s}
+  defp command("CREATE", [name], s) do
+    with {:ok, name} <- astring(name),
+         :ok <- Mailbox.create_folder(s.account.id, name) do
+      {[], {:ok, "CREATE completed"}, s}
+    else
+      error -> folder_error(error, s)
+    end
+  end
+
+  defp command("DELETE", [name], s) do
+    with {:ok, name} <- astring(name) do
+      # Deleting the selected folder unselects it first.
+      s = if selected_folder?(s, name), do: unselect(s), else: s
+
+      case Mailbox.delete_folder(s.account.id, name) do
+        :ok -> {[], {:ok, "DELETE completed"}, s}
+        error -> folder_error(error, s)
+      end
+    else
+      error -> folder_error(error, s)
+    end
+  end
+
+  defp command("RENAME", [old, new], s) do
+    with {:ok, old} <- astring(old),
+         {:ok, new} <- astring(new),
+         :ok <- Mailbox.rename_folder(s.account.id, old, new) do
+      {[], {:ok, "RENAME completed"}, s}
+    else
+      error -> folder_error(error, s)
+    end
+  end
 
   defp command(cmd, [name | _], s) when cmd in ["SELECT", "EXAMINE"] do
     case astring(name) do
@@ -180,7 +246,12 @@ defmodule Mailstore.Imap.Session do
 
   defp command(cmd, [ref, pattern], s) when cmd in ["LIST", "LSUB"] do
     with {:ok, ref} <- astring(ref), {:ok, pattern} <- astring(pattern) do
-      {list(s, cmd, ref <> pattern, pattern), {:ok, "#{cmd} completed"}, s}
+      out =
+        if cmd == "LSUB" and pattern != "",
+          do: lsub(s, ref <> pattern),
+          else: list(s, cmd, ref <> pattern, pattern)
+
+      {out, {:ok, "#{cmd} completed"}, s}
     else
       _ -> {[], {:bad, "Invalid arguments"}, s}
     end
@@ -301,7 +372,7 @@ defmodule Mailstore.Imap.Session do
     s = unselect(s)
     read_only = cmd == "EXAMINE"
 
-    case Mailbox.subscribe(s.account.id, name) do
+    case Mailbox.subscribe(s.account.id, name, read_only: read_only) do
       {:ok, actor, view} ->
         # The UIDs and first unseen come from the actor's memory, taken atomically with
         # the subscription: no database query, and every later change arrives as a push.
@@ -326,18 +397,15 @@ defmodule Mailstore.Imap.Session do
             },
             map: map,
             actor: actor,
-            highest_modseq: view.highest_modseq
+            highest_modseq: view.highest_modseq,
+            keywords: MapSet.new(view.keywords),
+            recent: MapSet.new(view.recent)
         }
 
         out = [
-          ["* FLAGS ", @system_flags, "\r\n"],
-          [
-            "* OK [PERMANENTFLAGS ",
-            if(read_only, do: "()", else: @permanent_flags),
-            "] Flags permitted\r\n"
-          ],
+          flags_responses(s),
           ["* ", Integer.to_string(UidMap.size(map)), " EXISTS\r\n"],
-          "* 0 RECENT\r\n",
+          ["* ", Integer.to_string(MapSet.size(s.recent)), " RECENT\r\n"],
           unseen,
           ["* OK [UIDVALIDITY ", Integer.to_string(view.uidvalidity), "] UIDs valid\r\n"],
           [
@@ -364,23 +432,111 @@ defmodule Mailstore.Imap.Session do
         map: %UidMap{},
         actor: nil,
         pending: [],
-        own_modseqs: MapSet.new()
+        own_modseqs: MapSet.new(),
+        keywords: MapSet.new(),
+        recent: MapSet.new()
     }
   end
 
   defp unselect(s), do: s
+
+  # FLAGS and PERMANENTFLAGS: system flags plus the keywords used in the folder.
+  defp flags_responses(s) do
+    flags = @system_flags ++ Enum.sort(s.keywords)
+    permanent = if s.folder.read_only, do: [], else: flags ++ ["\\*"]
+
+    [
+      ["* FLAGS ", Format.flags(flags), "\r\n"],
+      ["* OK [PERMANENTFLAGS ", Format.flags(permanent), "] Flags permitted\r\n"]
+    ]
+  end
+
+  # Flags as this session shows them: a keyword the client has not seen in FLAGS yet is
+  # announced first (RFC 3501 7.2.6), and its own recent messages carry \\Recent.
+  defp show_flags(s, rows) do
+    new =
+      for %{flags: flags} <- rows,
+          flag <- flags,
+          not String.starts_with?(flag, "\\"),
+          not MapSet.member?(s.keywords, flag),
+          uniq: true,
+          do: flag
+
+    {announce, s} =
+      if new == [] do
+        {[], s}
+      else
+        s = %{s | keywords: MapSet.union(s.keywords, MapSet.new(new))}
+        {flags_responses(s), s}
+      end
+
+    rows =
+      Enum.map(rows, fn row ->
+        if MapSet.member?(s.recent, row.uid),
+          do: %{row | flags: row.flags ++ ["\\Recent"]},
+          else: row
+      end)
+
+    {announce, rows, s}
+  end
+
+  defp folder_error({:error, :invalid_name}, s), do: {[], {:no, "Invalid folder name"}, s}
+
+  defp folder_error({:error, :no_such_folder}, s),
+    do: {[], {:no, "[NONEXISTENT] No such folder"}, s}
+
+  defp folder_error({:error, :already_exists}, s),
+    do: {[], {:no, "[ALREADYEXISTS] Folder already exists"}, s}
+
+  defp folder_error({:error, :inbox}, s), do: {[], {:no, "[CANNOT] Not allowed for INBOX"}, s}
+
+  defp folder_error({:error, :has_children}, s),
+    do: {[], {:no, "[HASCHILDREN] Folder has children, delete them first"}, s}
+
+  defp folder_error({:error, :into_itself}, s),
+    do: {[], {:no, "[CANNOT] Cannot move a folder into itself"}, s}
+
+  defp folder_error(:error, s), do: {[], {:bad, "Invalid arguments"}, s}
+  defp folder_error({:error, _}, s), do: {[], {:no, "[SERVERBUG] Folder operation failed"}, s}
+
+  defp selected_folder?(%{state: :selected, folder: folder}, name),
+    do: FolderName.normalize(name) == {:ok, folder.name}
+
+  defp selected_folder?(_s, _name), do: false
 
   defp list(s, cmd, full_pattern, pattern) do
     if pattern == "" do
       [~s{* }, cmd, ~s{ (\\Noselect) "/" ""\r\n}]
     else
       regex = pattern_regex(full_pattern)
+      folders = Mailbox.list_folders(s.account.tenant_id, s.account.id)
+      names = Enum.map(folders, & &1.name)
 
-      for f <- Mailbox.list_folders(s.account.tenant_id, s.account.id),
+      for f <- folders,
           Regex.match?(regex, f.name) or (f.name == "INBOX" and Regex.match?(regex, "inbox")) do
-        attrs = Enum.reject(["\\HasNoChildren", f.special_use], &is_nil/1)
+        children? = Enum.any?(names, &String.starts_with?(&1, f.name <> "/"))
+        children = if children?, do: "\\HasChildren", else: "\\HasNoChildren"
+        attrs = Enum.reject([children, f.special_use], &is_nil/1)
         ["* ", cmd, " (", Enum.join(attrs, " "), ~s{) "/" }, Format.string(f.name), "\r\n"]
       end
+    end
+  end
+
+  # LSUB: subscribed folders. With "%", a folder that is not subscribed but has a
+  # subscribed folder below it is listed as \Noselect (RFC 3501 6.3.9).
+  defp lsub(s, pattern) do
+    regex = pattern_regex(pattern)
+    folders = Mailbox.list_folders(s.account.tenant_id, s.account.id)
+    subscribed = for f <- folders, f.subscribed, do: f.name
+
+    candidates =
+      if String.contains?(pattern, "*"),
+        do: subscribed,
+        else: subscribed |> Enum.flat_map(&(FolderName.parents(&1) ++ [&1])) |> Enum.uniq()
+
+    for name <- Enum.sort(candidates), Regex.match?(regex, name) do
+      attrs = if name in subscribed, do: "", else: "\\Noselect"
+      ["* LSUB (", attrs, ~s{) "/" }, Format.string(name), "\r\n"]
     end
   end
 
@@ -398,7 +554,7 @@ defmodule Mailstore.Imap.Session do
   defp status_item("UIDNEXT", v), do: "UIDNEXT #{v.uidnext}"
   defp status_item("UIDVALIDITY", v), do: "UIDVALIDITY #{v.uidvalidity}"
   defp status_item("UNSEEN", v), do: "UNSEEN #{v.unseen_count}"
-  defp status_item("RECENT", _v), do: "RECENT 0"
+  defp status_item("RECENT", v), do: "RECENT #{v.recent}"
   defp status_item(_, _v), do: nil
 
   defp append_args(tokens) do
@@ -455,6 +611,8 @@ defmodule Mailstore.Imap.Session do
 
     raws = Mailbox.fetch_raw_many(account.tenant_id, folder.id, raw_uids)
 
+    {announce, msgs, s} = show_flags(s, msgs)
+
     out =
       for m <- msgs, seq = UidMap.seq(s.map, m.uid), seq != nil do
         items =
@@ -465,7 +623,7 @@ defmodule Mailstore.Imap.Session do
         Fetch.render(seq, items, m, raws[m.uid])
       end
 
-    {out, s}
+    {[announce, out], s}
   end
 
   defp store(%{folder: %{read_only: true}} = s, _, _, _, _, _),
@@ -475,15 +633,21 @@ defmodule Mailstore.Imap.Session do
     {:ok, changes} = Mailbox.store_flags(s.account.id, s.folder.name, uids, mode, flags)
     s = own(s, changes)
 
-    out =
+    {out, s} =
       if silent? do
-        []
+        # Still announce new keywords: later FETCH FLAGS must not show unknown ones.
+        {announce, _, s} = show_flags(s, Enum.map(changes, &%{uid: &1.uid, flags: &1.flags}))
+        {announce, s}
       else
-        for m <- Mailbox.fetch_meta(s.account.tenant_id, s.folder.id, uids),
-            seq = UidMap.seq(s.map, m.uid),
-            seq != nil do
-          Fetch.render(seq, if(uid?, do: [:uid, :flags], else: [:flags]), m, nil)
-        end
+        rows = Mailbox.fetch_meta(s.account.tenant_id, s.folder.id, uids)
+        {announce, rows, s} = show_flags(s, rows)
+
+        out =
+          for m <- rows, seq = UidMap.seq(s.map, m.uid), seq != nil do
+            Fetch.render(seq, if(uid?, do: [:uid, :flags], else: [:flags]), m, nil)
+          end
+
+        {[announce, out], s}
       end
 
     {out, {:ok, "STORE completed"}, s}
@@ -537,7 +701,7 @@ defmodule Mailstore.Imap.Session do
   #   :full  - envelope (and bodies for TEXT/BODY/non-envelope HEADER)
   defp search(s, tree, uid?) do
     %{account: account, folder: folder, map: map} = s
-    ctx = %{max_seq: UidMap.size(map), max_uid: UidMap.max_uid(map)}
+    ctx = %{max_seq: UidMap.size(map), max_uid: UidMap.max_uid(map), recent: s.recent}
     candidates = Search.candidates(tree, map)
 
     hits =
@@ -634,6 +798,15 @@ defmodule Mailstore.Imap.Session do
 
   @doc "An actor push arrived at the connection. Returns output to send now (only during IDLE)."
   @spec handle_push({:mailstore, integer, term}, t) :: {iodata, t}
+  # Rename and delete take effect at once: the next command must use the new name, and
+  # a deleted folder ends the session (BYE may be sent at any time).
+  def handle_push(
+        {:mailstore, folder_id, event},
+        %{state: :selected, folder: %{id: folder_id}} = s
+      )
+      when event == :deleted or elem(event, 0) == :renamed,
+      do: apply_event(event, s)
+
   def handle_push(
         {:mailstore, folder_id, event},
         %{state: :selected, folder: %{id: folder_id}} = s
@@ -650,7 +823,7 @@ defmodule Mailstore.Imap.Session do
   """
   @spec handle_actor_down(t) :: {iodata, t}
   def handle_actor_down(%{state: :selected} = s) do
-    case Mailbox.subscribe(s.account.id, s.folder.name) do
+    case Mailbox.subscribe(s.account.id, s.folder.name, read_only: s.folder.read_only) do
       {:ok, actor, view} -> resync(%{s | actor: actor}, view.uids)
       {:error, _} -> {"* BYE Folder is unavailable\r\n", %{s | state: :logout}}
     end
@@ -686,6 +859,14 @@ defmodule Mailstore.Imap.Session do
     apply_events(rest, mode, s, [out | acc])
   end
 
+  # New mail that is \\Recent in this session: EXISTS, then the new RECENT count.
+  defp apply_event({:exists, uids, view, :recent}, s) do
+    {out, s} = apply_event({:exists, uids, view}, s)
+    new = Enum.filter(uids, &UidMap.seq(s.map, &1))
+    s = %{s | recent: MapSet.union(s.recent, MapSet.new(new))}
+    {[out, "* ", Integer.to_string(MapSet.size(s.recent)), " RECENT\r\n"], s}
+  end
+
   defp apply_event({:exists, uids, _view}, s) do
     before = UidMap.size(s.map)
     map = UidMap.append(s.map, uids)
@@ -702,6 +883,8 @@ defmodule Mailstore.Imap.Session do
     if MapSet.member?(s.own_modseqs, modseq) do
       {[], %{s | own_modseqs: MapSet.delete(s.own_modseqs, modseq)}}
     else
+      {announce, changes, s} = show_flags(s, changes)
+
       out =
         for %{uid: uid, flags: flags} <- changes, seq = UidMap.seq(s.map, uid), seq != nil do
           [
@@ -715,7 +898,7 @@ defmodule Mailstore.Imap.Session do
           ]
         end
 
-      {out, %{s | highest_modseq: max(s.highest_modseq, modseq)}}
+      {[announce, out], %{s | highest_modseq: max(s.highest_modseq, modseq)}}
     end
   end
 
@@ -725,6 +908,10 @@ defmodule Mailstore.Imap.Session do
   end
 
   defp apply_event({:reload, _view}, s), do: resync(s)
+  defp apply_event({:renamed, view}, s), do: {[], put_in(s.folder.name, view.name)}
+
+  defp apply_event(:deleted, s),
+    do: {"* BYE Selected folder was deleted\r\n", %{unselect(s) | state: :logout}}
 
   # `current`: the folder's UIDs now, from a fresh subscription; nil reads them from the
   # database (after retention, when the actor has dropped its state).
@@ -739,27 +926,32 @@ defmodule Mailstore.Imap.Session do
     {exists, s} = apply_event({:exists, new, nil}, s)
 
     changed = Mailbox.changed_since(account.tenant_id, folder.id, s.highest_modseq)
+    rows = Enum.map(changed, &%{uid: &1.uid, flags: Flags.to_list(&1.flags, &1.keywords)})
+    {announce, rows, s} = show_flags(s, rows)
 
     flags =
-      for c <- changed, seq = UidMap.seq(s.map, c.uid), seq != nil do
+      for c <- rows, seq = UidMap.seq(s.map, c.uid), seq != nil do
         [
           "* ",
           Integer.to_string(seq),
           " FETCH (UID ",
           Integer.to_string(c.uid),
           " FLAGS ",
-          Format.flags(Flags.to_list(c.flags, c.keywords)),
+          Format.flags(c.flags),
           ")\r\n"
         ]
       end
 
     highest = Enum.reduce(changed, s.highest_modseq, &max(&1.modseq, &2))
-    {[expunges, exists, flags], %{s | highest_modseq: highest, pending: []}}
+    {[expunges, exists, announce, flags], %{s | highest_modseq: highest, pending: []}}
   end
 
   defp remove(s, uids) do
     {seqs, map} = UidMap.remove(s.map, uids)
-    {for(seq <- seqs, do: ["* ", Integer.to_string(seq), " EXPUNGE\r\n"]), %{s | map: map}}
+    recent = Enum.reduce(uids, s.recent, &MapSet.delete(&2, &1))
+
+    {for(seq <- seqs, do: ["* ", Integer.to_string(seq), " EXPUNGE\r\n"]),
+     %{s | map: map, recent: recent}}
   end
 
   defp own(s, changes) do

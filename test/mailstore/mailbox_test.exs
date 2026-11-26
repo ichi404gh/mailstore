@@ -37,8 +37,9 @@ defmodule Mailstore.MailboxTest do
     {:ok, _pid, view} = Mailbox.subscribe(a.id, "INBOX")
     fid = view.id
 
+    # The only read-write subscriber gets the new message as \\Recent.
     {:ok, [1]} = Mailbox.append(a.id, "INBOX", [new_message()])
-    assert_receive {:mailstore, ^fid, {:exists, [1], %{uidnext: 2, unseen_count: 1}}}
+    assert_receive {:mailstore, ^fid, {:exists, [1], %{uidnext: 2, unseen_count: 1}, :recent}}
 
     {:ok, [%{uid: 1, flags: ["\\Seen"], modseq: m1}]} =
       Mailbox.store_flags(a.id, "INBOX", [1], :add, ["\\Seen"])

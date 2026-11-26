@@ -32,3 +32,6 @@ deps/
 # Stalwart comparison stand: downloaded binary and run state (bench/stalwart/README.md).
 /bench/stalwart/.bin/
 /bench/stalwart/.run/
+
+# Compatibility runs: downloaded test suites.
+/compat/.cache/

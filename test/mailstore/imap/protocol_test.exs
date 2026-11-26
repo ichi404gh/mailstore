@@ -90,6 +90,30 @@ defmodule Mailstore.Imap.ProtocolTest do
                ~s{(NIL "Hi" (("Alice" NIL "a" "ex.org")) (("Alice" NIL "a" "ex.org")) (("Alice" NIL "a" "ex.org")) NIL NIL NIL NIL "<1@x>")}
     end
 
+    test "address lists: groups, comments, routes, missing parts" do
+      assert [
+               %{mailbox: "team", host: nil},
+               %{name: nil, mailbox: "a", host: "x.org"},
+               %{name: "Bee", mailbox: "b", host: "y.org"},
+               %{mailbox: nil, host: nil}
+             ] = Address.parse_list(~s|team: a@x.org, "Bee" <b@y.org>;|)
+
+      assert [%{name: "Real Name", mailbox: "user", host: "domain"}] =
+               Address.parse_list("user@domain (Real Name)")
+
+      assert [%{name: nil, mailbox: "u", host: "d.org"}] =
+               Address.parse_list("<u (c)@ (c) d.org>")
+
+      assert [%{adl: "@route", mailbox: "u", host: "d"}] = Address.parse_list("<@route:u@d>")
+      assert [%{mailbox: "d", host: "MISSING_DOMAIN"}] = Address.parse_list("d")
+
+      env = %{"from" => "a@x", "sender" => "", "to" => "g:;", "subject" => "a  b"}
+
+      assert env |> Format.envelope() |> IO.iodata_to_binary() ==
+               ~s{(NIL "a b" ((NIL NIL "a" "x")) ((NIL NIL "a" "x")) ((NIL NIL "a" "x")) } <>
+                 ~s{((NIL NIL "g" NIL)(NIL NIL NIL NIL)) NIL NIL NIL NIL)}
+    end
+
     test "strings: quoted when safe, literal otherwise" do
       assert Format.string("a\"b") |> IO.iodata_to_binary() == ~s("a\\"b")
       assert Format.string("café") |> IO.iodata_to_binary() == "{5}\r\ncafé"

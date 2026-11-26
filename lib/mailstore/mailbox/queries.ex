@@ -30,6 +30,11 @@ defmodule Mailstore.Mailbox.Queries do
   """
   def uid_ranges(folder_id), do: ranges_of(messages_in(folder_id))
 
+  @doc "Keywords used in a folder (for the FLAGS response)."
+  def folder_keywords(folder_id) do
+    from m in messages_in(folder_id), distinct: true, select: fragment("unnest(?)", m.keywords)
+  end
+
   @doc "Runs of unseen UIDs, from the partial index `messages_folder_unseen`."
   def unseen_uid_ranges(folder_id) do
     ranges_of(from(m in messages_in(folder_id), where: fragment("(? & 1) = 0", m.flags)))

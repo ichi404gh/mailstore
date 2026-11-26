@@ -69,22 +69,24 @@ defmodule Mailstore.Imap.Format do
 
   @doc "ENVELOPE from the header values stored at delivery."
   def envelope(env) when is_map(env) do
-    from = env["from"]
+    from = Address.parse_list(env["from"])
+    # Sender and Reply-To default to From, also when present but empty (RFC 3501 7.4.2).
+    or_from = fn value -> with [] <- Address.parse_list(value), do: from end
 
     [
       "(",
       Enum.intersperse(
         [
-          string(env["date"]),
-          string(env["subject"]),
+          string(squeeze(env["date"])),
+          string(squeeze(env["subject"])),
           addresses(from),
-          addresses(env["sender"] || from),
-          addresses(env["reply_to"] || from),
-          addresses(env["to"]),
-          addresses(env["cc"]),
-          addresses(env["bcc"]),
-          string(env["in_reply_to"]),
-          string(env["message_id"])
+          addresses(or_from.(env["sender"])),
+          addresses(or_from.(env["reply_to"])),
+          addresses(Address.parse_list(env["to"])),
+          addresses(Address.parse_list(env["cc"])),
+          addresses(Address.parse_list(env["bcc"])),
+          string(squeeze(env["in_reply_to"])),
+          string(squeeze(env["message_id"]))
         ],
         " "
       ),
@@ -93,6 +95,10 @@ defmodule Mailstore.Imap.Format do
   end
 
   def envelope(nil), do: envelope(%{})
+
+  # Runs of spaces and tabs become one space, as in Dovecot's ENVELOPE.
+  defp squeeze(nil), do: nil
+  defp squeeze(value), do: String.replace(value, ~r/[ \t]+/, " ")
 
   @doc """
   BODY (`extensible? = false`) or BODYSTRUCTURE from a `Mailstore.Core.Mime` tree.
@@ -189,21 +195,21 @@ defmodule Mailstore.Imap.Format do
 
   defp language(_), do: "NIL"
 
-  defp addresses(value) do
-    case Address.parse_list(value) do
-      [] ->
-        "NIL"
+  defp addresses([]), do: "NIL"
 
-      list ->
-        [
+  defp addresses(list) do
+    [
+      "(",
+      for(
+        a <- list,
+        do: [
           "(",
-          for(
-            a <- list,
-            do: ["(", string(a.name), " NIL ", string(a.mailbox), " ", string(a.host), ")"]
-          ),
+          Enum.map_intersperse([a.name, a.adl, a.mailbox, a.host], " ", &string/1),
           ")"
         ]
-    end
+      ),
+      ")"
+    ]
   end
 
   defp month_number(mon) do
