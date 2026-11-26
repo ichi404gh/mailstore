@@ -8,7 +8,9 @@ config :mailstore, Mailstore.Repo,
   # ~400 KB with OS defaults, allocated for every reply however small. Our replies are
   # a few KB. Capped also because the inet driver caches freed read buffers per
   # scheduler and hands any big-enough one to the next socket that asks.
-  socket_options: [buffer: 65_536]
+  socket_options: [buffer: 65_536],
+  # A failover: the old primary is a replica now (see Mailstore.Shards.repo_config/1).
+  disconnect_on_error_codes: [:read_only_sql_transaction]
 
 # How long an account actor lives without subscribers. Longer than the sequencers' poll
 # interval, so polling does not restart the actor every time.

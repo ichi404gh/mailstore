@@ -58,7 +58,7 @@ defmodule Mailstore.Mailbox.AccountServer do
 
   alias Mailstore.{Directory, Shards}
   alias Mailstore.Core.{FolderName, Flags, UidMap}
-  alias Mailstore.Mailbox.{Commands, Placement, Queries}
+  alias Mailstore.Mailbox.{Commands, Placement, Queries, Unavailable}
 
   @registry Mailstore.Mailbox.Registry
   @supervisor Mailstore.Mailbox.AccountSupervisor
@@ -221,6 +221,9 @@ defmodule Mailstore.Mailbox.AccountServer do
       {:error, :tenant_moved} when moved > 1 ->
         Process.sleep(100)
         call(account_id, msg, attempts, moved - 1)
+
+      {:error, :unavailable} ->
+        raise Unavailable
 
       other ->
         other
@@ -583,8 +586,19 @@ defmodule Mailstore.Mailbox.AccountServer do
       {:error, :tenant_moved}
 
     e in [Postgrex.Error, DBConnection.ConnectionError] ->
+      db_error(st, e)
+  end
+
+  # A failover or a lost connection: the caller gets `Mailstore.Mailbox.Unavailable`
+  # and may retry. Anything else is a bug and is passed on as is.
+  defp db_error(st, e) do
+    if Unavailable.transient?(e) do
+      Logger.warning("account #{st.account_id}: shard unavailable: #{Exception.message(e)}")
+      {:error, :unavailable}
+    else
       Logger.error("account #{st.account_id}: #{Exception.message(e)}")
       {:error, e}
+    end
   end
 
   # Folder state for SELECT / SEARCH UNSEEN, loaded once and then kept current.
@@ -610,9 +624,7 @@ defmodule Mailstore.Mailbox.AccountServer do
         {:ok, cached, st}
     end
   rescue
-    e in [Postgrex.Error, DBConnection.ConnectionError] ->
-      Logger.error("account #{st.account_id}: #{Exception.message(e)}")
-      {:error, e}
+    e in [Postgrex.Error, DBConnection.ConnectionError] -> db_error(st, e)
   end
 
   # New UIDs in folder `name` from any writer (see the moduledoc): skip those already

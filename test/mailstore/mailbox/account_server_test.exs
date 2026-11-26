@@ -41,7 +41,7 @@ defmodule Mailstore.Mailbox.AccountServerTest do
         Process.sleep(:infinity)
       end)
 
-    assert_receive {:subscribed, actor}
+    assert_receive {:subscribed, actor}, 1_000
     ref = Process.monitor(actor)
     refute_receive {:DOWN, ^ref, _, _, _}, 300
 

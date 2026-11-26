@@ -25,18 +25,6 @@ defmodule Mailstore.Ingest.Pipeline do
   alias Mailstore.Delivery
   alias Mailstore.Ingest.{DeadLetter, Record}
 
-  @transient_codes [
-    :admin_shutdown,
-    :crash_shutdown,
-    :cannot_connect_now,
-    :too_many_connections,
-    :read_only_sql_transaction,
-    :deadlock_detected,
-    :serialization_failure,
-    :lock_not_available,
-    :query_canceled
-  ]
-
   def start_link(config) do
     Broadway.start_link(__MODULE__,
       name: Keyword.get(config, :name, __MODULE__),
@@ -194,7 +182,10 @@ defmodule Mailstore.Ingest.Pipeline do
   end
 
   defp transient?(%DBConnection.ConnectionError{}), do: true
-  defp transient?(%Postgrex.Error{postgres: %{code: code}}), do: code in @transient_codes
+
+  defp transient?(%Postgrex.Error{postgres: %{code: code}}),
+    do: code in Mailstore.Mailbox.Unavailable.transient_codes()
+
   defp transient?(%Postgrex.Error{}), do: true
   defp transient?(_), do: false
 

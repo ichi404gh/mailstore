@@ -149,8 +149,13 @@ defmodule Mailstore.Imap.Session do
     end
   rescue
     e ->
-      Logger.error("IMAP #{cmd} failed: " <> Exception.format(:error, e, __STACKTRACE__))
-      {[], {:no, "[SERVERBUG] Internal error"}, s}
+      if Mailbox.Unavailable.transient?(e) do
+        Logger.warning("IMAP #{cmd}: storage unavailable: #{Exception.message(e)}")
+        {[], {:no, "[UNAVAILABLE] Mail storage temporarily unavailable, try again"}, s}
+      else
+        Logger.error("IMAP #{cmd} failed: " <> Exception.format(:error, e, __STACKTRACE__))
+        {[], {:no, "[SERVERBUG] Internal error"}, s}
+      end
   end
 
   # -- any state --

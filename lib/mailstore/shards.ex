@@ -165,6 +165,10 @@ defmodule Mailstore.Shards do
       url: url,
       pool_size: pool_size,
       socket_options: [buffer: 65_536],
+      # After a switchover the old primary comes back as a replica, and the proxy may
+      # still route a reconnect there until its health check notices: drop such a
+      # connection instead of failing every write on it.
+      disconnect_on_error_codes: [:read_only_sql_transaction],
       log: false,
       telemetry_prefix: [:mailstore, :repo]
     ]
