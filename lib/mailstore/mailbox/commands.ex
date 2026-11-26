@@ -2,7 +2,8 @@ defmodule Mailstore.Mailbox.Commands do
   @moduledoc """
   Write side of a shard: plain SQL, one function per IMAP write command. Every
   function must run inside `repo.transaction/1`. Only `Mailstore.Mailbox.AccountServer`
-  calls these; everything else goes through `Mailstore.Mailbox`.
+  and `Mailstore.Mailbox.deliver/1` call these; everything else goes through
+  `Mailstore.Mailbox`.
 
   Correctness does not depend on the account actor: UIDs and MODSEQs come from an
   atomic `UPDATE folders ... RETURNING` (or a `FOR UPDATE` lock on the folder row), so
@@ -45,36 +46,242 @@ defmodule Mailstore.Mailbox.Commands do
       msgs
       |> Enum.with_index()
       |> Enum.map(fn {m, i} ->
-        uid = first_uid + i
-        {codec, data} = BodyCodec.encode(m.raw)
-
-        {%{
-           tenant_id: tenant_id,
-           folder_id: folder_id,
-           uid: uid,
-           modseq: first_modseq + i,
-           stored_at: stored_at,
-           internal_date: m.internal_date,
-           size: m.size,
-           flags: m.flags_mask,
-           keywords: m.keywords,
-           class: m.class,
-           message_id: m.message_id,
-           message_id_h: m.message_id_h,
-           in_reply_to_h: m.in_reply_to_h,
-           thread_id: m.thread_id,
-           from_addr: m.from_addr,
-           subject: m.subject,
-           envelope: m.envelope,
-           bodystructure: m.bodystructure
-         }, %{folder_id: folder_id, uid: uid, stored_at: stored_at, codec: codec, data: data}}
+        rows(m, tenant_id, folder_id, first_uid + i, first_modseq + i, stored_at)
       end)
       |> Enum.unzip()
 
-    repo.insert_all(Message, meta)
-    repo.insert_all(MessageBody, bodies)
-
+    insert_rows(repo, meta, bodies)
     {Enum.map(meta, & &1.uid), counters}
+  end
+
+  @doc """
+  Group commit for delivery: many messages to many folders of many accounts in one
+  transaction, a fixed number of statements whatever the batch size.
+
+  `items`: `%{account_id, tenant_id, folder, msg, key}`, where `folder` is a folder name
+  as stored and `key` a binary that identifies the delivery (or nil). A key already in
+  `deliveries` for that account (also earlier in the same batch) makes the item a
+  duplicate: nothing is stored and no UID is spent, so replaying a batch is harmless.
+
+  Folder rows are locked in id order before UIDs are allocated (concurrent batches
+  touching the same folders cannot deadlock each other), and stay locked until commit:
+  UIDs of a folder are therefore committed in ascending order, which the account actor
+  relies on (`AccountServer.delivered/2`).
+
+  Returns `{results, updates}`: one result per item, in order (`{:stored, folder_id,
+  uid}`, `:duplicate` or `{:failed, :no_such_folder}`), and one update per folder that
+  got messages: `%{account_id, folder_id, uids, unseen, keywords, counters}`.
+  """
+  def deliver(repo, items, opts \\ []) do
+    stored_at = Keyword.get(opts, :stored_at, DateTime.utc_now())
+    items = Enum.with_index(items)
+    {keep, duplicates} = dedup(repo, items)
+    folders = lock_folders(repo, keep)
+
+    {placed, missing} =
+      Enum.split_with(keep, fn {item, _i} ->
+        Map.has_key?(folders, {item.account_id, item.folder})
+      end)
+
+    by_folder =
+      Enum.group_by(placed, fn {item, _i} -> folders[{item.account_id, item.folder}] end)
+
+    counters = bump_folders(repo, by_folder)
+
+    # Each folder's new UIDs and MODSEQs end at its counters after the bump.
+    placed =
+      Enum.flat_map(by_folder, fn {folder_id, group} ->
+        c = counters[folder_id]
+        first = length(group) - 1
+
+        group
+        |> Enum.with_index()
+        |> Enum.map(fn {{item, i}, k} ->
+          %{
+            index: i,
+            item: item,
+            folder_id: folder_id,
+            uid: c.uidnext - first - 1 + k,
+            modseq: c.highest_modseq - first + k
+          }
+        end)
+      end)
+
+    {meta, bodies} =
+      placed
+      |> Enum.map(fn p ->
+        rows(p.item.msg, p.item.tenant_id, p.folder_id, p.uid, p.modseq, stored_at)
+      end)
+      |> Enum.unzip()
+
+    insert_rows(repo, meta, bodies)
+
+    updates =
+      placed
+      |> Enum.group_by(& &1.folder_id)
+      |> Enum.map(fn {folder_id, ps} ->
+        %{
+          account_id: hd(ps).item.account_id,
+          folder_id: folder_id,
+          uids: Enum.map(ps, & &1.uid),
+          unseen: for(p <- ps, not Flags.seen?(p.item.msg.flags_mask), do: p.uid),
+          keywords: ps |> Enum.flat_map(& &1.item.msg.keywords) |> Enum.uniq(),
+          counters: counters[folder_id]
+        }
+      end)
+
+    results =
+      (Enum.map(placed, &{&1.index, {:stored, &1.folder_id, &1.uid}}) ++
+         Enum.map(duplicates, fn {_item, i} -> {i, :duplicate} end) ++
+         Enum.map(missing, fn {_item, i} -> {i, {:failed, :no_such_folder}} end))
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.map(&elem(&1, 1))
+
+    {results, updates}
+  end
+
+  # Record the keys; an item is kept if it has no key or its key was recorded by this
+  # statement (once: the first occurrence in the batch). NOT EXISTS sees every day's
+  # partition; the primary key catches a concurrent transaction recording the same key.
+  defp dedup(repo, items) do
+    keyed =
+      for {%{key: key} = item, _i} <- items,
+          is_binary(key),
+          uniq: true,
+          do: {item.account_id, key}
+
+    recorded =
+      if keyed == [] do
+        MapSet.new()
+      else
+        {accounts, keys} = keyed |> Enum.sort() |> Enum.unzip()
+
+        %{rows: rows} =
+          repo.query!(
+            """
+            INSERT INTO deliveries (account_id, key)
+            SELECT a, k FROM unnest($1::bigint[], $2::bytea[]) AS v(a, k)
+            WHERE NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.account_id = v.a AND d.key = v.k)
+            ON CONFLICT DO NOTHING
+            RETURNING account_id, key
+            """,
+            [accounts, keys]
+          )
+
+        MapSet.new(rows, fn [a, k] -> {a, k} end)
+      end
+
+    {keep, dups, _taken} =
+      Enum.reduce(items, {[], [], MapSet.new()}, fn {item, _i} = entry, {keep, dups, taken} ->
+        case item[:key] do
+          nil ->
+            {[entry | keep], dups, taken}
+
+          key ->
+            id = {item.account_id, key}
+
+            if MapSet.member?(recorded, id) and not MapSet.member?(taken, id),
+              do: {[entry | keep], dups, MapSet.put(taken, id)},
+              else: {keep, [entry | dups], taken}
+        end
+      end)
+
+    {Enum.reverse(keep), Enum.reverse(dups)}
+  end
+
+  # %{{account_id, folder_name} => folder_id}, rows locked in id order.
+  defp lock_folders(_repo, []), do: %{}
+
+  defp lock_folders(repo, keep) do
+    {accounts, names} =
+      keep
+      |> Enum.map(fn {item, _i} -> {item.account_id, item.folder} end)
+      |> Enum.uniq()
+      |> Enum.unzip()
+
+    %{rows: rows} =
+      repo.query!(
+        """
+        SELECT f.id, f.account_id, f.name
+        FROM folders f JOIN unnest($1::bigint[], $2::text[]) AS v(a, n)
+          ON f.account_id = v.a AND f.name = v.n
+        ORDER BY f.id
+        FOR UPDATE OF f
+        """,
+        [accounts, names]
+      )
+
+    Map.new(rows, fn [id, account_id, name] -> {{account_id, name}, id} end)
+  end
+
+  # One UPDATE for all folders: %{folder_id => counters after the batch}.
+  defp bump_folders(_repo, by_folder) when map_size(by_folder) == 0, do: %{}
+
+  defp bump_folders(repo, by_folder) do
+    {ids, ns, unseen} =
+      by_folder
+      |> Enum.map(fn {id, group} ->
+        {id, length(group),
+         Enum.count(group, fn {item, _i} -> not Flags.seen?(item.msg.flags_mask) end)}
+      end)
+      |> unzip3()
+
+    %{rows: rows} =
+      repo.query!(
+        """
+        UPDATE folders f
+        SET uidnext = f.uidnext + v.n, highest_modseq = f.highest_modseq + v.n,
+            messages_count = f.messages_count + v.n, unseen_count = f.unseen_count + v.unseen,
+            updated_at = now()
+        FROM unnest($1::bigint[], $2::int[], $3::int[]) AS v(id, n, unseen)
+        WHERE f.id = v.id
+        RETURNING f.id, #{@counters}
+        """,
+        [ids, ns, unseen]
+      )
+
+    Map.new(rows, fn [id | counters] -> {id, counters(counters)} end)
+  end
+
+  defp unzip3(triples) do
+    {a, b, c} =
+      Enum.reduce(triples, {[], [], []}, fn {x, y, z}, {a, b, c} ->
+        {[x | a], [y | b], [z | c]}
+      end)
+
+    {Enum.reverse(a), Enum.reverse(b), Enum.reverse(c)}
+  end
+
+  defp rows(m, tenant_id, folder_id, uid, modseq, stored_at) do
+    {codec, data} = m.body || BodyCodec.encode(m.raw)
+
+    {%{
+       tenant_id: tenant_id,
+       folder_id: folder_id,
+       uid: uid,
+       modseq: modseq,
+       stored_at: stored_at,
+       internal_date: m.internal_date,
+       size: m.size,
+       flags: m.flags_mask,
+       keywords: m.keywords,
+       class: m.class,
+       message_id: m.message_id,
+       message_id_h: m.message_id_h,
+       in_reply_to_h: m.in_reply_to_h,
+       thread_id: m.thread_id,
+       from_addr: m.from_addr,
+       subject: m.subject,
+       envelope: m.envelope,
+       bodystructure: m.bodystructure
+     }, %{folder_id: folder_id, uid: uid, stored_at: stored_at, codec: codec, data: data}}
+  end
+
+  # Postgres takes at most 65 535 parameters per statement: 18 columns x 1 000 rows fits.
+  defp insert_rows(repo, meta, bodies) do
+    for chunk <- Enum.chunk_every(meta, 1_000), do: repo.insert_all(Message, chunk)
+    for chunk <- Enum.chunk_every(bodies, 1_000), do: repo.insert_all(MessageBody, chunk)
+    :ok
   end
 
   @doc """

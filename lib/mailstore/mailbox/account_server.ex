@@ -20,6 +20,17 @@ defmodule Mailstore.Mailbox.AccountServer do
   consistent hashing of `account_id` and callers reach it via `:erpc`. Correctness
   does not depend on there being exactly one actor; see `Mailstore.Mailbox.Commands`.
 
+  Delivery writes behind the actor's back (`Mailstore.Mailbox.deliver/1`, group commit
+  across accounts) and then tells it what it stored (`delivered/2`). New UIDs of a
+  folder therefore come from several writers, and notifications may arrive out of
+  order; sessions must still see each UID once and in ascending order. The actor keeps
+  per folder the first UID it has not announced yet (`next_uid`). UIDs of a folder are
+  committed in ascending order (the folder row stays locked from UID allocation to
+  commit), so when new UIDs start above `next_uid`, the ones in between are already
+  committed by a writer whose notification is still on its way: the actor reads them
+  from the database and announces them first, and skips them when that notification
+  arrives.
+
   `subscribe/3` returns the folder view plus a snapshot taken atomically with the
   subscription: `:uids` (a `UidMap`), `:first_unseen` (UID or nil), `:keywords` and
   `:recent` (UIDs that are \\Recent for this session).
@@ -27,8 +38,10 @@ defmodule Mailstore.Mailbox.AccountServer do
   \\Recent (RFC 3501 2.3.2): a message is recent in exactly one session, the first that
   selects the folder read-write after it arrived, or the read-write session that has the
   folder selected when it arrives (its push is `{:exists, uids, view, :recent}`). The
-  actor tracks the first unclaimed UID per folder in memory only, starting at UIDNEXT
-  when it starts: \\Recent is advisory and gone in IMAP4rev2. Every change
+  actor tracks the first unclaimed UID per folder in memory, starting from
+  `folders.recent_uid`, and writes it back when it stops (one UPDATE per actor
+  lifetime, none on SELECT). After a crash some messages are \\Recent again, which is
+  harmless: \\Recent is advisory and gone in IMAP4rev2. Every change
   after it arrives as a push, so the session needs no database query and has no window
   in which a change could be missed.
 
@@ -133,6 +146,18 @@ defmodule Mailstore.Mailbox.AccountServer do
   def copy(account_id, from, uids, to), do: call(account_id, {:copy, from, uids, to})
   def move(account_id, from, uids, to), do: call(account_id, {:move, from, uids, to})
 
+  @doc """
+  Messages stored by a group commit (`Mailstore.Mailbox.deliver/1`). Only a running actor
+  needs to hear about it: one that starts later reads the folders after the commit.
+  `update`: `%{folder_id, uids, unseen, keywords, counters}`.
+  """
+  def delivered(account_id, update) do
+    case whereis(account_id) do
+      nil -> :ok
+      pid -> GenServer.cast(pid, {:delivered, update})
+    end
+  end
+
   @doc "Ask every local actor to reload folder state (after retention jobs)."
   def reload_all do
     for pid <- Registry.select(@registry, [{{:_, :"$1", :_}, [], [:"$1"]}]),
@@ -166,6 +191,8 @@ defmodule Mailstore.Mailbox.AccountServer do
         :ignore
 
       account ->
+        # So that terminate/2 runs on supervisor shutdown too and saves \\Recent.
+        Process.flag(:trap_exit, true)
         repo = Shards.repo(account.tenant_id)
 
         state =
@@ -175,6 +202,7 @@ defmodule Mailstore.Mailbox.AccountServer do
             repo: repo,
             folders: load_folders(repo, account_id),
             recent_from: %{},
+            next_uid: %{},
             cache: %{},
             subs: %{},
             idle_timeout:
@@ -233,20 +261,7 @@ defmodule Mailstore.Mailbox.AccountServer do
            tx(st, fn -> Commands.append(st.repo, f.id, st.tenant_id, msgs, opts) end) do
       unseen = for {m, uid} <- Enum.zip(msgs, uids), not Flags.seen?(m.flags_mask), do: uid
       keywords = Enum.flat_map(msgs, & &1.keywords)
-
-      st =
-        st
-        |> put_counters(name, counters)
-        |> update_cache(f.id, fn c ->
-          %{
-            c
-            | uids: UidMap.append(c.uids, uids),
-              unseen: UidMap.append(c.unseen, unseen),
-              keywords: MapSet.union(c.keywords, MapSet.new(keywords))
-          }
-        end)
-
-      st = notify_exists(st, f.id, uids, st.folders[norm(name)])
+      st = advance(st, norm(name), uids, unseen, keywords, counters)
       reply({:ok, uids}, st)
     else
       error -> reply(error, st)
@@ -306,12 +321,8 @@ defmodule Mailstore.Mailbox.AccountServer do
          {:ok, {mapping, counters}} <-
            tx(st, fn -> Commands.copy(st.repo, src.id, uids, dst.id) end) do
       # Copies keep their source flags, which the actor may not have: reload on next use.
-      st = st |> put_counters(to, counters) |> drop_cache(dst.id)
-
-      st =
-        if mapping != [],
-          do: notify_exists(st, dst.id, Enum.map(mapping, &elem(&1, 1)), st.folders[norm(to)]),
-          else: st
+      st = drop_cache(st, dst.id)
+      st = advance(st, norm(to), Enum.map(mapping, &elem(&1, 1)), [], [], counters)
 
       reply({:ok, %{uidvalidity: dst.uidvalidity, mapping: mapping}}, st)
     else
@@ -342,18 +353,12 @@ defmodule Mailstore.Mailbox.AccountServer do
 
       st =
         st
-        |> put_counters(to, dst_counters)
         |> put_counters(from, src_counters)
         |> drop_cache(dst.id)
         |> forget_uids(src.id, expunged)
 
-      st =
-        if mapping != [] do
-          notify(st, src.id, {:expunge, expunged, modseq})
-          notify_exists(st, dst.id, Enum.map(mapping, &elem(&1, 1)), st.folders[norm(to)])
-        else
-          st
-        end
+      if mapping != [], do: notify(st, src.id, {:expunge, expunged, modseq})
+      st = advance(st, norm(to), Enum.map(mapping, &elem(&1, 1)), [], [], dst_counters)
 
       reply({:ok, %{uidvalidity: dst.uidvalidity, mapping: mapping}}, st)
     else
@@ -425,8 +430,21 @@ defmodule Mailstore.Mailbox.AccountServer do
   end
 
   @impl true
+  def handle_cast({:delivered, update}, st) do
+    case Enum.find(st.folders, fn {_name, f} -> f.id == update.folder_id end) do
+      nil ->
+        noreply(st)
+
+      {name, _f} ->
+        noreply(advance(st, name, update.uids, update.unseen, update.keywords, update.counters))
+    end
+  end
+
+  # Sessions resync from the database after {:reload, view}: start counting from there.
   def handle_cast(:reload, st) do
-    st = %{st | folders: load_folders(st.repo, st.account_id), cache: %{}}
+    folders = load_folders(st.repo, st.account_id)
+    next_uid = Map.new(Map.values(folders), &{&1.id, &1.uidnext})
+    st = %{st | folders: folders, cache: %{}, next_uid: next_uid}
 
     for {pid, {fid, _ref, _rw}} <- st.subs do
       case Enum.find(Map.values(st.folders), &(&1.id == fid)) do
@@ -450,6 +468,36 @@ defmodule Mailstore.Mailbox.AccountServer do
     if map_size(st.subs) == 0, do: {:stop, :normal, st}, else: noreply(st)
   end
 
+  def handle_info({:EXIT, _pid, _reason}, st), do: noreply(st)
+
+  @impl true
+  def terminate(_reason, st) do
+    changed =
+      for {_name, f} <- st.folders,
+          from = Map.get(st.recent_from, f.id),
+          from != nil and from > f.recent_uid,
+          do: {f.id, from}
+
+    if changed != [] do
+      {ids, froms} = Enum.unzip(changed)
+
+      st.repo.query!(
+        """
+        UPDATE folders f SET recent_uid = v.r
+        FROM unnest($1::bigint[], $2::bigint[]) AS v(id, r)
+        WHERE f.id = v.id AND f.recent_uid < v.r
+        """,
+        [ids, froms]
+      )
+    end
+
+    :ok
+  rescue
+    e in [Postgrex.Error, DBConnection.ConnectionError] ->
+      Logger.warning("account #{st.account_id}: \\Recent not saved: #{Exception.message(e)}")
+      :ok
+  end
+
   # ---- helpers ------------------------------------------------------------
 
   defp tx(st, fun) do
@@ -461,7 +509,7 @@ defmodule Mailstore.Mailbox.AccountServer do
   end
 
   # Folder state for SELECT / SEARCH UNSEEN, loaded once and then kept current.
-  defp cached(st, %{id: fid}) do
+  defp cached(st, %{id: fid} = f) do
     case st.cache do
       %{^fid => cached} ->
         {:ok, cached, st}
@@ -473,12 +521,83 @@ defmodule Mailstore.Mailbox.AccountServer do
           keywords: MapSet.new(st.repo.all(Queries.folder_keywords(fid)))
         }
 
-        {:ok, cached, put_in(st.cache[fid], cached)}
+        # The load may see messages whose notification is still on its way. Sessions
+        # already subscribed (the cache was dropped under them by a COPY) get them now;
+        # the notification will then be skipped.
+        from = next_uid(st, f)
+        missed = UidMap.uids_between(cached.uids, from, UidMap.max_uid(cached.uids))
+        st = put_in(st.cache[fid], cached)
+        st = if missed == [], do: st, else: announce(st, f, missed)
+        {:ok, cached, st}
     end
   rescue
     e in [Postgrex.Error, DBConnection.ConnectionError] ->
       Logger.error("account #{st.account_id}: #{Exception.message(e)}")
       {:error, e}
+  end
+
+  # New UIDs in folder `name` from any writer (see the moduledoc): skip those already
+  # announced, read and announce first any committed ones below them, then these.
+  defp advance(st, name, uids, unseen, keywords, counters) do
+    st = merge_counters(st, name, counters)
+    f = st.folders[name]
+    from = next_uid(st, f)
+
+    case Enum.filter(uids, &(&1 >= from)) do
+      [] ->
+        st
+
+      [first | _] = fresh ->
+        {gap, gap_unseen, gap_keywords} =
+          if first > from, do: read_new(st, f.id, from, first), else: {[], [], []}
+
+        uids = gap ++ fresh
+        unseen = gap_unseen ++ Enum.filter(unseen, &(&1 >= from))
+
+        st
+        |> update_cache(f.id, fn c ->
+          %{
+            c
+            | uids: UidMap.append(c.uids, uids),
+              unseen: UidMap.append(c.unseen, unseen),
+              keywords: MapSet.union(c.keywords, MapSet.new(gap_keywords ++ keywords))
+          }
+        end)
+        |> announce(f, uids)
+    end
+  end
+
+  # Committed messages of a folder with from <= uid < to: {uids, unseen uids, keywords}.
+  defp read_new(st, folder_id, from, to) do
+    %{rows: rows} =
+      st.repo.query!(
+        """
+        SELECT uid, flags, keywords FROM messages
+        WHERE folder_id = $1 AND uid >= $2 AND uid < $3 ORDER BY uid
+        """,
+        [folder_id, from, to]
+      )
+
+    {Enum.map(rows, &hd/1), for([uid, flags, _] <- rows, not Flags.seen?(flags), do: uid),
+     Enum.flat_map(rows, &List.last/1)}
+  end
+
+  defp announce(st, f, uids) do
+    next = List.last(uids) + 1
+    view = %{f | uidnext: max(f.uidnext, next)}
+    st = put_in(st.next_uid[f.id], next)
+    notify_exists(st, f.id, uids, view)
+  end
+
+  defp next_uid(st, f), do: Map.get(st.next_uid, f.id, f.uidnext)
+
+  # Counters only move forward: a notification can be older than what the actor has.
+  defp merge_counters(st, _name, nil), do: st
+
+  defp merge_counters(st, name, counters) do
+    if counters.highest_modseq >= st.folders[name].highest_modseq,
+      do: put_counters(st, name, counters),
+      else: st
   end
 
   defp update_cache(st, folder_id, fun) do
@@ -510,6 +629,7 @@ defmodule Mailstore.Mailbox.AccountServer do
          :special_use,
          :uidvalidity,
          :uidnext,
+         :recent_uid,
          :highest_modseq,
          :retained_from_uid,
          :messages_count,
@@ -557,20 +677,22 @@ defmodule Mailstore.Mailbox.AccountServer do
       send(pid, {:mailstore, folder_id, event})
     end
 
-    if claimer, do: put_in(st.recent_from[folder_id], view.uidnext), else: st
+    if claimer, do: put_in(st.recent_from[folder_id], List.last(uids) + 1), else: st
   end
 
   defp recent_from(st, f), do: Map.get(st.recent_from, f.id, f.uidnext)
 
-  # Messages that arrived before the actor started are not recent; neither are those
-  # of a folder created later until something arrives.
+  # Where each folder's \\Recent and announced UIDs start when the actor first sees it.
   defp track_recent(st) do
-    recent =
-      Enum.reduce(Map.values(st.folders), st.recent_from, fn f, acc ->
-        Map.put_new(acc, f.id, f.uidnext)
-      end)
+    put_new = fn map, field ->
+      Enum.reduce(Map.values(st.folders), map, &Map.put_new(&2, &1.id, Map.fetch!(&1, field)))
+    end
 
-    %{st | recent_from: recent}
+    %{
+      st
+      | recent_from: put_new.(st.recent_from, :recent_uid),
+        next_uid: put_new.(st.next_uid, :uidnext)
+    }
   end
 
   # STATUS RECENT: unclaimed messages. Without the folder state in memory, everything

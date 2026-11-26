@@ -10,7 +10,9 @@ defmodule Mailstore.Application do
         Mailstore.Repo,
         Mailstore.Directory.Cache,
         Mailstore.Mailbox.Supervisor
-      ] ++ if(Mailstore.Imap.enabled?(), do: [Mailstore.Imap], else: [])
+      ] ++
+        if(Mailstore.Imap.enabled?(), do: [Mailstore.Imap], else: []) ++
+        if(Mailstore.Ingest.enabled?(), do: [Mailstore.Ingest], else: [])
 
     Supervisor.start_link(children, strategy: :one_for_one, name: Mailstore.Supervisor)
   end

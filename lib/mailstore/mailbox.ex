@@ -8,7 +8,9 @@ defmodule Mailstore.Mailbox do
   The single entry point for IMAP sessions and delivery:
 
     * writes go through the account's actor (`Mailbox.AccountServer`), which
-      serializes them and pushes deltas to subscribed sessions;
+      serializes them and pushes deltas to subscribed sessions; except delivery
+      (`deliver/1`), which writes a whole batch for many accounts in one transaction
+      and then tells the running actors what arrived;
     * reads (FETCH, SEARCH, resync) go straight to the shard, so the actor never
       becomes a read bottleneck.
 
@@ -16,7 +18,7 @@ defmodule Mailstore.Mailbox do
   (read queries), `Schemas.*`, `Partitions` (retention).
   """
   alias Mailstore.Core.{BodyCodec, Flags, NewMessage}
-  alias Mailstore.Mailbox.{AccountServer, Partitions, Queries}
+  alias Mailstore.Mailbox.{AccountServer, Commands, Partitions, Queries}
   alias Mailstore.Mailbox.Schemas.Folder
   alias Mailstore.Shards
 
@@ -73,6 +75,53 @@ defmodule Mailstore.Mailbox do
 
   @doc "Append `Mailstore.Core.NewMessage`s. Returns {:ok, uids}."
   defdelegate append(account_id, folder, msgs, opts \\ []), to: AccountServer
+
+  @doc """
+  Delivery with group commit: one transaction per shard for the whole batch, then the
+  running account actors are told what arrived (they push EXISTS to their sessions).
+
+  `items`: `%{account_id, tenant_id, msg}` plus optional `folder` (default "INBOX")
+  and `key` (binary): an item whose key was already delivered to that account is
+  reported as `:duplicate` and not stored again, so a batch can be replayed safely.
+
+  Returns `{:ok, results}`, one per item in order: `{:stored, account_id, folder, uid}`,
+  `{:duplicate, account_id}` or `{:failed, account_id, reason}`. Database errors raise:
+  nothing of the shard's part of the batch was stored then.
+  """
+  def deliver(items) do
+    items
+    |> Enum.map(&Map.put_new(&1, :folder, "INBOX"))
+    |> Enum.with_index()
+    |> Enum.group_by(fn {item, _i} -> Shards.repo(item.tenant_id) end)
+    |> Enum.flat_map(fn {repo, group} ->
+      {items, indexes} = Enum.unzip(group)
+      {results, updates} = deliver_tx(repo, items, 3)
+      for u <- updates, do: AccountServer.delivered(u.account_id, u)
+
+      Enum.zip_with([indexes, items, results], fn [i, item, result] ->
+        {i, result(item, result)}
+      end)
+    end)
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.map(&elem(&1, 1))
+    |> then(&{:ok, &1})
+  end
+
+  # A deadlock (with an actor's MOVE locking two folders) or a serialization failure
+  # aborts the whole transaction; the batch is idempotent, so just run it again.
+  defp deliver_tx(repo, items, attempts) do
+    {:ok, result} = repo.transaction(fn -> Commands.deliver(repo, items) end)
+    result
+  rescue
+    e in Postgrex.Error ->
+      if attempts > 1 and e.postgres[:code] in [:deadlock_detected, :serialization_failure],
+        do: deliver_tx(repo, items, attempts - 1),
+        else: reraise(e, __STACKTRACE__)
+  end
+
+  defp result(item, {:stored, _folder_id, uid}), do: {:stored, item.account_id, item.folder, uid}
+  defp result(item, :duplicate), do: {:duplicate, item.account_id}
+  defp result(item, {:failed, reason}), do: {:failed, item.account_id, reason}
 
   @doc "op: :add | :remove | :replace. Returns {:ok, [%{uid, flags, modseq}]}."
   defdelegate store_flags(account_id, folder, uids, op, flags), to: AccountServer

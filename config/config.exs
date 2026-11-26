@@ -31,6 +31,27 @@ config :mailstore, :directory_cache,
   full_reload_ms: :timer.minutes(10),
   auth_ttl_ms: :timer.hours(1)
 
+# Inbound queue: Kafka topics filled by the SMTP layer (see Mailstore.Ingest). Off by
+# default; MAILSTORE_KAFKA_HOSTS turns it on (config/runtime.exs).
+config :mailstore, :ingest,
+  enabled: false,
+  hosts: [localhost: 9092],
+  topics: ["mailhub_relay_sender_in.basic", "mailhub_relay_sender_in.priority"],
+  group_id: "mailstore-ingest",
+  # Where a new consumer group starts. Replays are harmless (idempotent writes).
+  offset_reset_policy: :latest,
+  offset_commit_interval_seconds: 5,
+  dead_letter_topic: nil,
+  # One batch = one transaction per shard. At 1 000 records/s a 200 ms window gives
+  # batches of ~100 and a lag of ~0.3 s (bench/README.md, "Очередь входящих").
+  batch_size: 200,
+  batch_timeout: 200,
+  batchers: 2
+
+# How long delivered keys are remembered (dedup of replays). Must exceed the retention
+# of anything ingest can replay from: the source topics and the dead-letter topic.
+config :mailstore, :delivery_dedup_days, 8
+
 # PBKDF2 cost for new password hashes.
 config :mailstore, :pbkdf2_iterations, 100_000
 

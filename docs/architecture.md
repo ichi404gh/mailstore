@@ -22,7 +22,7 @@ flowchart LR
   end
 
   smtp["Входящий SMTP<br/>проверка RCPT TO"]:::planned
-  queue[("Очередь входящих")]:::planned
+  queue[("Kafka<br/>mailhub_relay_sender_in<br/>.basic / .priority")]
 
   hap["HAProxy × N<br/>:993, неявный TLS"]
 
@@ -43,7 +43,7 @@ flowchart LR
   clients -->|IMAPS| hap
   hap -->|"PROXY v2 + IMAP"| compute
   smtp --> queue
-  queue -.->|"консьюмер доставки"| compute
+  queue -->|"Ingest: Broadway,<br/>групповая запись"| compute
   dir -.->|"зеркало в ETS"| compute
   compute -->|"шард по tenant"| storage
   compute -.->|"Range GET"| obj
@@ -81,7 +81,11 @@ flowchart TB
   ms --> asup["AccountSupervisor<br/>DynamicSupervisor"]
   asup --> a1["AccountServer<br/>аккаунт 1"]
   asup --> a2["AccountServer<br/>аккаунт N"]
-  ms --> pm["PartitionMaintainer<br/>недельные партиции"]
+  ms --> pm["PartitionMaintainer<br/>недельные партиции,<br/>дни deliveries"]
+
+  app --> ing["Ingest<br/>(если включён)"]
+  ing --> dl["brod-клиент<br/>dead-letter топика"]
+  ing --> pipe["Pipeline (Broadway):<br/>4 продюсера, процессоры,<br/>2 батчера"]
 
   app --> imap["Imap"]
   imap --> l1["Listener :1143<br/>(прямой, ranch)"]
@@ -104,6 +108,7 @@ flowchart TB
 ```mermaid
 flowchart LR
   imap["Imap<br/>IMAP4rev1-сервер"]
+  ingest["Ingest<br/>консьюмер Kafka"]
   delivery["Delivery<br/>маршрутизация входящего"]
   directory["Directory<br/>кто существует, пароли,<br/>правила пересылки"]
   mailbox["Mailbox<br/>папки и письма,<br/>актор аккаунта"]
@@ -116,7 +121,8 @@ flowchart LR
   imap -->|"subscribe, append, store,<br/>fetch, search"| mailbox
   imap -->|"span на команду"| telemetry
   delivery -->|"lookup_account,<br/>forwardings_for"| directory
-  delivery -->|append| mailbox
+  ingest -->|deliver_many| delivery
+  delivery -->|"deliver<br/>(групповая запись)"| mailbox
   mailbox --> shards --> repo
   directory --> repo
   imap --> core
@@ -126,43 +132,38 @@ flowchart LR
 
 ## 4. Доставка письма
 
-Письмо разбирается один раз (`Core.NewMessage`: заголовки, ENVELOPE и дерево MIME-частей со смещениями из `Core.Mime`), затем применяются правила пересылки: копия в мастер-инбокс (с фильтром по классу, чтобы warmup туда не попадал), redirect без сохранения оригинала или внешняя пересылка. UID выдаёт база атомарным `UPDATE ... RETURNING`, актор только упорядочивает записи и рассылает изменения сессиям.
+Записи из Kafka разбирают процессоры Broadway, параллельно: JSON, заголовки, ENVELOPE и дерево MIME-частей (`Core.NewMessage`), сжатие тела. Затем применяются правила пересылки: копия в мастер-инбокс (с фильтром по классу, чтобы warmup туда не попадал), redirect без сохранения оригинала или внешняя пересылка. Пачка до 200 записей (или за 200 мс) пишется одной транзакцией на шард, мимо акторов. Повтор пачки безопасен: ключ доставки (хеш получателя и байтов письма) записывается в `deliveries` в той же транзакции, и уже доставленное не пишется второй раз. Офсеты коммитятся в Kafka раз в несколько секунд. После коммита запущенные акторы получателей узнают, что пришло, и рассылают EXISTS своим сессиям.
 
 ```mermaid
 sequenceDiagram
   autonumber
-  participant Q as Очередь входящих<br/>(сейчас — прямой вызов)
-  participant D as Delivery
+  participant K as Kafka
+  participant P as Ingest.Pipeline<br/>(процессоры)
+  participant B as Ingest.Pipeline<br/>(батчер)
   participant DC as Directory.Cache<br/>(ETS)
-  participant A as AccountServer<br/>получателя
   participant PG as Шард Postgres
+  participant A as AccountServer<br/>(если запущен)
   participant C as Connection<br/>(сессия в IDLE)
 
-  Q->>D: deliver(raw, rcpt, class)
-  D->>DC: lookup_account(rcpt)
-  DC-->>D: account (без запроса в БД)
-  D->>DC: forwardings_for(account, class)
-  DC-->>D: правила
-  D->>A: Mailbox.append("INBOX", msg)
-  Note over A: актор стартует по требованию<br/>через Registry + DynamicSupervisor
-  A->>PG: BEGIN
-  A->>PG: UPDATE folders SET uidnext, highest_modseq,<br/>счётчики RETURNING uid
-  A->>PG: INSERT messages (метаданные)
-  A->>PG: INSERT message_bodies (тело в zstd)
-  A->>PG: COMMIT
-  A-->>D: {:ok, [uid]}
+  K->>P: записи (JSON)
+  P->>P: Record.parse, NewMessage.from_raw, zstd
+  P->>B: пачка до 200 записей или за 200 мс
+  B->>DC: lookup_account, forwardings_for
+  DC-->>B: аккаунты и правила (без запроса в БД)
+  B->>PG: BEGIN
+  B->>PG: INSERT deliveries ... ON CONFLICT DO NOTHING<br/>(уже доставленные отсеиваются)
+  B->>PG: SELECT folders ... ORDER BY id FOR UPDATE
+  B->>PG: UPDATE folders: uidnext, счётчики (одним запросом)
+  B->>PG: INSERT messages, message_bodies (всей пачкой)
+  B->>PG: COMMIT
+  B--)A: {:delivered, folder, uids, counters}
   A--)C: {:exists, uids, folder}
   C--)C: "* 42 EXISTS" клиенту
-  opt правило copy в мастер-инбокс
-    D->>A: append в INBOX целевого аккаунта (его актор)
-  end
-  opt правило redirect
-    Note over D: оригинал не сохраняется
-  end
-  opt внешний адрес
-    D-->>Q: {:external, address} — отправка вне прототипа
-  end
+  B->>K: офсеты, раз в 5 с
+  Note over B,K: после падения повторяется до 5 с потока:<br/>дубли отсеиваются по deliveries
 ```
+
+UID папки коммитятся по возрастанию: строка папки заблокирована от выдачи UID до коммита. Уведомления от разных писателей (групповая запись, собственные APPEND и COPY актора) могут прийти не по порядку. Поэтому актор помнит первый UID, о котором ещё не сообщал. Если новые UID начинаются выше него, промежуточные уже закоммичены и он дочитывает их из базы, а запоздавшее уведомление пропускает. Сессия видит каждый UID один раз и по возрастанию.
 
 ## 5. IMAP-сессия
 
@@ -263,6 +264,7 @@ erDiagram
   folders ||--o{ messages : "UID-пространство"
   messages ||--|| message_bodies : "тело"
   folders ||--o{ vanished : "удалённые UID"
+  accounts ||--o{ deliveries : "уже доставленное"
 
   folders {
     bigint id PK
@@ -270,6 +272,7 @@ erDiagram
     text name
     bigint uidvalidity
     bigint uidnext "выдача UID"
+    bigint recent_uid "первый не забранный как Recent"
     bigint highest_modseq
     bigint retained_from_uid "ниже — удалено по сроку"
     int messages_count
@@ -299,9 +302,16 @@ erDiagram
     bigint uid PK
     bigint modseq
   }
+  deliveries {
+    bigint account_id PK
+    bytea key PK "sha256(получатель, байты), 16 байт"
+    timestamptz created_at PK "ключ дневной партиции"
+  }
 ```
 
 Индексы `messages`: `(folder_id, modseq)` для CONDSTORE, частичный `(folder_id, uid) WHERE NOT \Seen` для UNSEEN, `(tenant_id, message_id_h)` и `thread_id` для тредов.
+
+`deliveries` помнит доставленное на срок, дольше которого ничего нельзя переиграть: хранение исходных топиков и dead-letter топика (по умолчанию 8 дней). Партиции дневные, старые удаляются `DROP`. Время вставки недетерминировано, поэтому повтор, попавший на другой день, ловит не первичный ключ, а проверка `NOT EXISTS` по всем партициям перед вставкой. Ключ закрывает только гонку двух транзакций в один день.
 
 ## 7. Жизненный цикл письма в хранилище
 

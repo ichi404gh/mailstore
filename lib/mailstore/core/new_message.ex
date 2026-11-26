@@ -3,7 +3,7 @@ defmodule Mailstore.Core.NewMessage do
   A message ready to be stored: the raw bytes plus everything derived from them
   once, at delivery time, so reads never re-parse the body.
   """
-  alias Mailstore.Core.{Flags, Headers, MessageClass, Mime}
+  alias Mailstore.Core.{BodyCodec, Flags, Headers, MessageClass, Mime}
 
   @enforce_keys [:raw]
   defstruct [
@@ -20,7 +20,9 @@ defmodule Mailstore.Core.NewMessage do
     :from_addr,
     :subject,
     :envelope,
-    :bodystructure
+    :bodystructure,
+    # {codec, data} once compressed (`compress/1`); otherwise the writer compresses.
+    :body
   ]
 
   @doc """
@@ -52,6 +54,13 @@ defmodule Mailstore.Core.NewMessage do
       bodystructure: Mime.parse(raw)
     }
   end
+
+  @doc """
+  Compress the body now, so the writer does not do it inside its transaction (ingest
+  calls this in parallel processors, before the group commit).
+  """
+  def compress(%__MODULE__{body: nil, raw: raw} = msg), do: %{msg | body: BodyCodec.encode(raw)}
+  def compress(msg), do: msg
 
   @doc "64-bit hash for compact indexes on header values."
   def hash64(nil), do: nil

@@ -8,6 +8,7 @@ defmodule Mailstore.Mailbox.Schemas.Folder do
     field :special_use, :string
     field :uidvalidity, :integer
     field :uidnext, :integer, default: 1
+    field :recent_uid, :integer, default: 1
     field :highest_modseq, :integer, default: 1
     field :retained_from_uid, :integer, default: 1
     field :messages_count, :integer, default: 0

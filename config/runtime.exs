@@ -27,6 +27,58 @@ if port = System.get_env("MAILSTORE_IMAP_PORT") do
          |> Keyword.put(:proxy_port, if(port == "0", do: 0, else: String.to_integer(port) + 1))
 end
 
+# Inbound queue, e.g. MAILSTORE_KAFKA_HOSTS="kfk1:9092,kfk2:9092".
+if hosts = System.get_env("MAILSTORE_KAFKA_HOSTS") do
+  hosts =
+    for hp <- String.split(hosts, ",", trim: true) do
+      [host, port] = String.split(hp, ":")
+      {String.to_atom(host), String.to_integer(port)}
+    end
+
+  env = fn name, default -> System.get_env(name, default) end
+
+  ingest =
+    Application.get_env(:mailstore, :ingest, [])
+    |> Keyword.merge(enabled: true, hosts: hosts)
+    |> Keyword.merge(
+      for {key, var} <- [
+            group_id: "MAILSTORE_KAFKA_GROUP",
+            dead_letter_topic: "MAILSTORE_KAFKA_DEAD_LETTER"
+          ],
+          value = env.(var, nil),
+          do: {key, value}
+    )
+
+  ingest =
+    case env.("MAILSTORE_KAFKA_TOPICS", nil) do
+      nil -> ingest
+      topics -> Keyword.put(ingest, :topics, String.split(topics, ",", trim: true))
+    end
+
+  ingest =
+    case env.("MAILSTORE_KAFKA_OFFSET_RESET", nil) do
+      nil -> ingest
+      "earliest" -> Keyword.put(ingest, :offset_reset_policy, :earliest)
+      "latest" -> Keyword.put(ingest, :offset_reset_policy, :latest)
+    end
+
+  ingest =
+    Keyword.merge(
+      ingest,
+      for(
+        {key, var} <- [
+          batch_size: "MAILSTORE_INGEST_BATCH_SIZE",
+          batch_timeout: "MAILSTORE_INGEST_BATCH_TIMEOUT",
+          batchers: "MAILSTORE_INGEST_BATCHERS"
+        ],
+        value = env.(var, nil),
+        do: {key, String.to_integer(value)}
+      )
+    )
+
+  config :mailstore, :ingest, ingest
+end
+
 if config_env() == :prod do
   config :mailstore, Mailstore.Repo,
     url: System.fetch_env!("DATABASE_URL"),

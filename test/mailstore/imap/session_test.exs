@@ -27,8 +27,12 @@ defmodule Mailstore.Imap.SessionTest do
     s
   end
 
+  # Delivery tells the account actor asynchronously; wait until it has pushed to us.
   defp deliver(opts \\ []) do
-    {:ok, _} = Delivery.deliver(raw_message(opts), "bob@acme.test", class: :reply)
+    {:ok, [{:stored, account_id, _, _}]} =
+      Delivery.deliver(raw_message(opts), "bob@acme.test", class: :reply)
+
+    if pid = Mailstore.Mailbox.AccountServer.whereis(account_id), do: :sys.get_state(pid)
   end
 
   describe "not authenticated" do

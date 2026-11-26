@@ -29,7 +29,11 @@ defmodule Mailstore.MixProject do
       {:postgrex, "~> 0.22"},
       {:jason, "~> 1.4"},
       {:ranch, "~> 2.4"},
-      {:telemetry, "~> 1.4"}
+      {:telemetry, "~> 1.4"},
+      # Ingest from Kafka. Pinned to releases at least two weeks old.
+      {:broadway, "== 1.3.1"},
+      {:broadway_kafka, "== 0.7.1"},
+      {:brod, "== 4.7.0"}
     ]
   end
 

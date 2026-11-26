@@ -8,10 +8,41 @@ defmodule Mailstore.Mailbox.Partitions do
   alias Mailstore.Repo
   alias Mailstore.Mailbox.AccountServer
 
-  @doc "Make sure partitions exist from last week up to `weeks` ahead."
+  @doc """
+  Make sure partitions exist: weekly message partitions from last week up to `weeks`
+  ahead, daily `deliveries` partitions from yesterday a week ahead.
+  """
   def ensure(repo \\ Repo, from \\ Date.add(Date.utc_today(), -7), weeks \\ 12) do
     repo.query!("SELECT mailstore_ensure_partitions($1, $2)", [from, weeks])
+
+    repo.query!("SELECT mailstore_ensure_delivery_partitions($1, $2)", [
+      Date.add(Date.utc_today(), -1),
+      8
+    ])
+
     :ok
+  end
+
+  @doc """
+  Forget deliveries recorded before `cutoff` (whole days): the dedup horizon. It must be
+  longer than anything can be replayed from, i.e. the retention of the source topics.
+  Returns the dropped partitions.
+  """
+  def drop_deliveries_before(repo \\ Repo, %Date{} = cutoff) do
+    %{rows: rows} =
+      repo.query!("""
+      SELECT c.relname
+      FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+      WHERE i.inhparent = 'deliveries'::regclass
+      ORDER BY c.relname
+      """)
+
+    limit = "deliveries_" <> Calendar.strftime(cutoff, "%Y%m%d")
+
+    for [name] <- rows, Regex.match?(~r/^deliveries_\d{8}$/, name), name < limit do
+      repo.query!("DROP TABLE #{name}")
+      name
+    end
   end
 
   @doc "messages partitions whose upper bound is <= cutoff."
