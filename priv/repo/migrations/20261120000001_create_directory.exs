@@ -1,8 +1,7 @@
 defmodule Mailstore.Repo.Migrations.CreateDirectory do
   @moduledoc """
-  Directory: who exists and where they live. In production this is one global
-  database (fed by the Django control plane) that every node mirrors into ETS.
-  The prototype keeps it in the same database as the mail shard.
+  Directory: who exists and where they live. One global database, separate from the
+  mail shards, that every node mirrors into ETS.
   """
   use Ecto.Migration
 

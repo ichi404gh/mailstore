@@ -9,6 +9,7 @@
 5. [IMAP-сессия](#5-imap-сессия)
 6. [Схема данных](#6-схема-данных)
 7. [Жизненный цикл письма в хранилище](#7-жизненный-цикл-письма-в-хранилище)
+8. [Перенос tenant на другой шард](#8-перенос-tenant-на-другой-шард)
 
 ## 1. Целевое развёртывание
 
@@ -31,7 +32,7 @@ flowchart LR
     n2["mailstore"]
   end
 
-  dir[("Directory<br/>tenants, домены, аккаунты,<br/>пересылки, реестр шардов")]
+  dir[("Directory (своя база)<br/>tenants, домены, аккаунты,<br/>пересылки, правила доставки,<br/>реестр шардов")]
 
   subgraph storage["Шарды Postgres (Patroni + PgBouncer)"]
     s1[("шард 1<br/>primary + реплика")]
@@ -72,9 +73,14 @@ flowchart TB
   tel --> cs["CommandStats<br/>(ETS-счётчики)"]
   tel --> rep["Reporter<br/>(если MAILSTORE_REPORT_MS)"]
 
-  app --> repo["Repo<br/>пул Postgrex"]
+  app --> repo["Repo<br/>пул к базе справочника"]
 
-  app --> dc["Directory.Cache<br/>владелец ETS:<br/>accounts, addresses,<br/>forwardings, auth"]
+  app --> rsup["Shards.RepoSupervisor<br/>DynamicSupervisor"]
+  rsup --> sr1["ShardRepo.S1<br/>пул к шарду 1"]
+  rsup --> sr2["ShardRepo.SN<br/>пул к шарду N"]
+  app --> sreg["Shards.Registry<br/>реестр шардов в ETS,<br/>запуск и закрытие пулов"]
+
+  app --> dc["Directory.Cache<br/>владелец ETS:<br/>accounts, addresses,<br/>forwardings, auth,<br/>tenants → шард, rules"]
 
   app --> cl["Cluster"]
   cl --> pg[":pg scope :mailstore<br/>члены кластера"]
@@ -106,6 +112,8 @@ flowchart TB
 
 `Imap.Session` — не процесс, а чистая машина состояний внутри `Connection`: на вход команда или уведомление актора, на выход байты ответа.
 
+Пул к каждому шарду — отдельный модуль репозитория (`Mailstore.ShardRepo.S<id>`), его создаёт `Shards.Registry` при загрузке реестра из справочника. Реестр перечитывается раз в 30 секунд и по сигналу после `Shards.register`, поэтому шард добавляется без перезапуска нод. Пулы шардов, пропавших из реестра, закрываются.
+
 ## 3. Контексты и зависимости
 
 Контекст — один публичный модуль, внутренности лежат в одноимённой папке. Контексты обращаются друг к другу только через публичные модули и никогда не трогают чужие схемы.
@@ -115,20 +123,24 @@ flowchart LR
   imap["Imap<br/>IMAP4rev1-сервер"]
   ingest["Ingest<br/>консьюмер Kafka"]
   delivery["Delivery<br/>маршрутизация входящего"]
-  directory["Directory<br/>кто существует, пароли,<br/>правила пересылки"]
+  directory["Directory<br/>кто существует, пароли,<br/>пересылки, правила доставки"]
   mailbox["Mailbox<br/>папки и письма,<br/>актор аккаунта"]
-  shards["Shards<br/>tenant → repo шарда"]
+  shards["Shards<br/>tenant → repo шарда,<br/>реестр, перенос tenant"]
   core["Core<br/>чистые функции: заголовки,<br/>флаги, классы, zstd"]
   telemetry["Telemetry"]
-  repo[("Repo")]
+  repo[("Справочник<br/>(Repo)")]
+  shardrepo[("Шарды<br/>(ShardRepo.S1..SN)")]
 
   imap -->|authenticate| directory
   imap -->|"subscribe, append, store,<br/>fetch, search"| mailbox
   imap -->|"span на команду"| telemetry
-  delivery -->|"lookup_account,<br/>forwardings_for"| directory
+  delivery -->|"lookup_account,<br/>forwardings_for, rules_for"| directory
   ingest -->|deliver_many| delivery
   delivery -->|"deliver<br/>(групповая запись)"| mailbox
-  mailbox --> shards --> repo
+  mailbox -->|"repo(tenant)"| shards
+  shards -->|"shard_of"| directory
+  shards --> shardrepo
+  shards -->|"реестр шардов"| repo
   directory --> repo
   imap --> core
   delivery --> core
@@ -224,7 +236,7 @@ sequenceDiagram
 
 ## 6. Схема данных
 
-Справочник (directory) — одна глобальная база со своей схемой (`priv/repo/migrations`): tenants, домены, ящики, правила, реестр шардов. Каждый шард — отдельная база со схемой шарда (`priv/shard/migrations`), в ней почта своих tenants. Внешних ключей и общих транзакций между ними нет. В разработке это базы одного сервера Postgres (`mailstore_dev`, `mailstore_dev_shard1`, ...). На диаграмме ниже обе схемы вместе, связи между ними логические.
+Справочник (directory) — одна глобальная база со своей схемой (`priv/repo/migrations`): tenants, домены, ящики, пересылки, правила доставки, реестр шардов. Каждый шард — отдельная база со схемой шарда (`priv/shard/migrations`), в ней почта своих tenants. Внешних ключей и общих транзакций между ними нет. В разработке это базы одного сервера Postgres (`mailstore_dev`, `mailstore_dev_shard1`, ...). На диаграмме ниже обе схемы вместе, связи между ними логические.
 
 ```mermaid
 erDiagram
@@ -233,6 +245,8 @@ erDiagram
   domains ||--o{ accounts : "содержит"
   accounts ||--o{ forwardings : "источник"
   accounts |o--o{ forwardings : "цель (или target_address)"
+  tenants |o--o{ delivery_rules : "scope = tenant"
+  accounts |o--o{ delivery_rules : "scope = account"
 
   tenants {
     bigint id PK
@@ -264,6 +278,22 @@ erDiagram
     text_array only_classes "например {reply}"
     boolean enabled
   }
+  delivery_rules {
+    bigint id PK
+    text scope "global | tenant | account"
+    bigint tenant_id FK
+    bigint account_id FK
+    text stage "detect | forward"
+    int position "порядок среди правил всех уровней"
+    jsonb spec "условие и действия"
+    boolean enabled
+  }
+  shards {
+    int id PK
+    text name UK
+    text url "строка подключения к базе шарда"
+    int pool_size
+  }
 
   shards ||--o{ tenants : "где живёт почта"
   folders ||--o{ messages : "UID-пространство"
@@ -272,7 +302,8 @@ erDiagram
   accounts ||--o{ deliveries : "уже доставленное"
 
   folders {
-    bigint id PK
+    bigint id PK "диапазон шарда: id << 40"
+    bigint tenant_id "из directory, без FK"
     bigint account_id "из directory, без FK"
     text name
     bigint uidvalidity
@@ -288,6 +319,7 @@ erDiagram
     bigint folder_id PK
     bigint uid PK
     timestamptz stored_at PK "ключ недельной партиции"
+    bigint tenant_id
     bigint modseq
     smallint flags "битовая маска"
     smallint class "warmup, reply, ..."
@@ -315,6 +347,8 @@ erDiagram
   }
 ```
 
+Каждый шард выдаёт id папок из своего диапазона (`shard_id << 40`), поэтому папки переносятся между шардами с теми же id, UID, UIDVALIDITY и MODSEQ.
+
 Индексы `messages`: `(folder_id, modseq)` для CONDSTORE, частичный `(folder_id, uid) WHERE NOT \Seen` для UNSEEN, `(tenant_id, message_id_h)` и `thread_id` для тредов.
 
 `deliveries` помнит доставленное на срок, дольше которого ничего нельзя переиграть: хранение исходных топиков и dead-letter топика (по умолчанию 8 дней). Партиции дневные, старые удаляются `DROP`. Время вставки недетерминировано, поэтому повтор, попавший на другой день, ловит не первичный ключ, а проверка `NOT EXISTS` по всем партициям перед вставкой. Ключ закрывает только гонку двух транзакций в один день.
@@ -336,3 +370,38 @@ flowchart TB
 ```
 
 Сроки хранения различаются по классам писем (например, warmup короче, ответы дольше): классы пишутся в отдельные партиции и удаляются целиком. Сейчас в прототипе один класс хранения.
+
+## 8. Перенос tenant на другой шард
+
+`Shards.move_tenant/2` переносит tenant, пока его ящики получают почту и обслуживают IMAP. Запись к tenant останавливается только на время заморозки: доливается дельта, накопленная за время копирования, а не весь объём. На стенде с непрерывной записью: 140 писем в дельте, заморозка 35 мс, весь перенос 245 мс.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant M as Move<br/>(любая нода кластера)
+  participant S as Старый шард
+  participant T as Новый шард
+  participant D as Справочник
+  participant N as Все ноды
+  participant W as Писатели<br/>(доставка, APPEND, STORE)
+
+  M->>S: снимок: HIGHESTMODSEQ и UIDNEXT каждой папки
+  M->>T: партиции под недели и дни tenant
+  M->>T: копирование без блокировок: письма, тела,<br/>vanished, ключи доставки (ON CONFLICT DO NOTHING)
+  W->>S: запись продолжается
+  rect rgba(128,128,128,0.15)
+    Note over M,S: заморозка, одна транзакция на старом шарде
+    M->>S: advisory lock tenant (стоп CREATE),<br/>SELECT folders ... FOR UPDATE
+    W--xS: писатели ждут блокировку строк папок
+    M->>T: одна транзакция: строки папок, письма с UID ≥ снимка,<br/>флаги с MODSEQ > снимка, удалённые по vanished,<br/>новые ключи доставки
+    M->>S: UPDATE folders SET fenced = true, COMMIT
+  end
+  S-->>W: TenantMoved (папки fenced)
+  M->>D: tenants.shard = новый
+  M->>N: moved_local: обновить кеш,<br/>остановить акторы ящиков tenant
+  W->>T: повтор записи на новом шарде
+  N--)N: сессии переподписываются и пересинхронизируются
+  M->>S: позже: cleanup_moved, удаление строк tenant
+```
+
+Если перенос упал до коммита на старом шарде, tenant остаётся на месте, а частичные данные на новом шарде перезапишет следующая попытка. Если упал после коммита, но до переключения, tenant закрыт на старом шарде и ещё не виден на новом: писатели повторяют попытки, а `Move.finish/2` доводит переключение. Сам он пока не продолжает прерванный перенос: `finish` запускают вручную.
