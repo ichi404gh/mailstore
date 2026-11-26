@@ -30,6 +30,7 @@ defmodule Mailstore.Mailbox.Partitions do
   never existed, so it can be computed from the UIDs that remain.
   """
   @chunk 1_000
+  @ensure_lock_timeout "2s"
   # Session advisory lock (key, policy id): one expiry per shard and policy at a time,
   # whichever node runs it.
   @expire_lock 7002
@@ -42,18 +43,31 @@ defmodule Mailstore.Mailbox.Partitions do
   Make sure partitions exist: for every retention policy, weekly message partitions
   from the week of `from` for `weeks` weeks; daily `deliveries` partitions from
   yesterday a week ahead.
+
+  Creating a partition takes an ACCESS EXCLUSIVE lock on its parent. Behind a long
+  query on the table (a big SEARCH, `pg_dump`) it would wait, and every insert and
+  read of the table would queue behind it; so it gives up after `lock_timeout` (2 s)
+  and raises (`lock_not_available`). Partitions are made weeks ahead (`deliveries` a
+  week), so a later try is in time. Partitions that exist take no lock.
   """
   def ensure(repo, from \\ Date.add(Date.utc_today(), -7), weeks \\ 5) do
-    repo.query!("SELECT mailstore_ensure_partitions($1::smallint[], $2, $3)", [
-      Mailstore.Mailbox.Retention.ids(),
-      from,
-      weeks
-    ])
+    {:ok, :ok} =
+      repo.transaction(fn ->
+        repo.query!("SET LOCAL lock_timeout = '#{@ensure_lock_timeout}'")
 
-    repo.query!("SELECT mailstore_ensure_delivery_partitions($1, $2)", [
-      Date.add(Date.utc_today(), -1),
-      8
-    ])
+        repo.query!("SELECT mailstore_ensure_partitions($1::smallint[], $2, $3)", [
+          Mailstore.Mailbox.Retention.ids(),
+          from,
+          weeks
+        ])
+
+        repo.query!("SELECT mailstore_ensure_delivery_partitions($1, $2)", [
+          Date.add(Date.utc_today(), -1),
+          8
+        ])
+
+        :ok
+      end)
 
     :ok
   end

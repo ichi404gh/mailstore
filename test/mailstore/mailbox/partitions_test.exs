@@ -131,6 +131,60 @@ defmodule Mailstore.Mailbox.PartitionsTest do
     assert {:ok, %{weeks: [], folder_updates: 0}} = Mailbox.apply_retention()
   end
 
+  test "making a partition behind a long query gives up instead of queueing every write" do
+    a = account_fixture("bob@acme.test")
+    repo = Shards.repo(a.tenant_id)
+    week = ~D[2031-01-06]
+    parent = self()
+
+    # A long reader of messages (a big SEARCH, pg_dump).
+    reader =
+      spawn_link(fn ->
+        repo.transaction(fn ->
+          repo.query!("SELECT count(*) FROM messages")
+          send(parent, :reading)
+          receive do: (:done -> :ok)
+        end)
+
+        send(parent, :read)
+      end)
+
+    assert_receive :reading
+    {us, result} = :timer.tc(fn -> catch_error(Partitions.ensure(repo, week, 1)) end)
+    assert %Postgrex.Error{postgres: %{code: :lock_not_available}} = result
+    assert us < 5_000_000
+
+    # Writes waited at most those 2 s and go through now; once the reader is gone it works.
+    {:ok, [_]} = Mailbox.append(a.id, "INBOX", [new_message()])
+    send(reader, :done)
+    assert_receive :read
+    assert :ok = Partitions.ensure(repo, week, 1)
+
+    for t <- ~w(messages message_bodies cold_bodies),
+        id <- Retention.ids(),
+        do: repo.query!("DROP TABLE IF EXISTS #{t}_p#{id}_2031w02")
+  end
+
+  test "partitions that exist are ensured without a lock, behind a long query too" do
+    a = account_fixture("bob@acme.test")
+    repo = Shards.repo(a.tenant_id)
+    parent = self()
+
+    reader =
+      spawn_link(fn ->
+        repo.transaction(fn ->
+          repo.query!("SELECT count(*) FROM messages")
+          send(parent, :reading)
+          receive do: (:done -> :ok)
+        end)
+      end)
+
+    assert_receive :reading
+    {us, :ok} = :timer.tc(fn -> Partitions.ensure(repo) end)
+    assert us < 1_000_000
+    send(reader, :done)
+  end
+
   test "a run that died after detaching a week is finished by the next one" do
     a = account_fixture("bob@acme.test")
     repo = Shards.repo(a.tenant_id)
