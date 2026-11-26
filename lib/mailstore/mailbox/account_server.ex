@@ -16,9 +16,11 @@ defmodule Mailstore.Mailbox.AccountServer do
     into the folder and on `reload_all/0`. SELECT and SEARCH UNSEEN read it instead of
     the database.
 
-  Prototype: placement is a local Registry. In a cluster the owner node comes from
-  consistent hashing of `account_id` and callers reach it via `:erpc`. Correctness
-  does not depend on there being exactly one actor; see `Mailstore.Mailbox.Commands`.
+  Placement: the actor of an account runs on its owner node (`Mailbox.Placement`,
+  rendezvous hashing over the cluster members); calls and delivery notifications from
+  any node are routed there with `:erpc`, and the actor pushes to sessions on any
+  node. Correctness does not depend on there being exactly one actor (during a
+  membership change there can briefly be two); see `Mailstore.Mailbox.Commands`.
 
   Delivery writes behind the actor's back (`Mailstore.Mailbox.deliver/1`, group commit
   across accounts) and then tells it what it stored (`delivered/2`). New UIDs of a
@@ -56,7 +58,7 @@ defmodule Mailstore.Mailbox.AccountServer do
 
   alias Mailstore.{Directory, Shards}
   alias Mailstore.Core.{FolderName, Flags, UidMap}
-  alias Mailstore.Mailbox.{Commands, Queries}
+  alias Mailstore.Mailbox.{Commands, Placement, Queries}
 
   @registry Mailstore.Mailbox.Registry
   @supervisor Mailstore.Mailbox.AccountSupervisor
@@ -152,35 +154,75 @@ defmodule Mailstore.Mailbox.AccountServer do
   `update`: `%{folder_id, uids, unseen, keywords, counters}`.
   """
   def delivered(account_id, update) do
+    owner = Placement.owner(account_id)
+    if owner != node(), do: :erpc.cast(owner, __MODULE__, :delivered_local, [account_id, update])
+    # Also a local actor, if any: the owner is here, or an old one is still handing over.
+    delivered_local(account_id, update)
+  end
+
+  @doc false
+  def delivered_local(account_id, update) do
     case whereis(account_id) do
       nil -> :ok
       pid -> GenServer.cast(pid, {:delivered, update})
     end
   end
 
-  @doc "Ask every local actor to reload folder state (after retention jobs)."
+  @doc "Ask every actor in the cluster to reload folder state (after retention jobs)."
   def reload_all do
+    for n <- Placement.members(), n != node(), do: :erpc.cast(n, __MODULE__, :reload_local, [])
+    reload_local()
+  end
+
+  @doc false
+  def reload_local do
     for pid <- Registry.select(@registry, [{{:_, :"$1", :_}, [], [:"$1"]}]),
         do: GenServer.cast(pid, :reload)
 
     :ok
   end
 
-  # The actor may be stopping on idle timeout just as we call it: retry with a fresh one.
-  defp call(account_id, msg, attempts \\ 3) do
+  # To the owner node. If it has just gone away, wait for the members to update and
+  # ask the new owner. (A write that reached a node which then died may be repeated:
+  # a duplicate is the lesser evil than a lost APPEND.)
+  defp call(account_id, msg, attempts \\ 5) do
+    owner = Placement.owner(account_id)
+
+    if owner == node() do
+      local_call(account_id, msg)
+    else
+      try do
+        :erpc.call(owner, __MODULE__, :local_call, [account_id, msg], @call_timeout + 1_000)
+      catch
+        :error, {:erpc, :noconnection} when attempts > 1 ->
+          Process.sleep(200)
+          call(account_id, msg, attempts - 1)
+      end
+    end
+  end
+
+  @doc false
+  # Runs on the owner node. The actor may be stopping (idle timeout, or handed over
+  # to another node) just as we call it: retry with a fresh one.
+  def local_call(account_id, msg, attempts \\ 3) do
     case ensure(account_id) do
       {:ok, pid} ->
         try do
           GenServer.call(pid, msg, @call_timeout)
         catch
-          :exit, {reason, _} when reason in [:noproc, :normal] and attempts > 1 ->
-            call(account_id, msg, attempts - 1)
+          :exit, {reason, _} when attempts > 1 ->
+            if stopping?(reason),
+              do: local_call(account_id, msg, attempts - 1),
+              else: exit({reason, {GenServer, :call, [pid, msg, @call_timeout]}})
         end
 
       {:error, _} = error ->
         error
     end
   end
+
+  defp stopping?(reason),
+    do: reason in [:noproc, :normal, :shutdown] or match?({:shutdown, _}, reason)
 
   # ---- server -------------------------------------------------------------
 

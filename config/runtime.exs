@@ -27,6 +27,13 @@ if port = System.get_env("MAILSTORE_IMAP_PORT") do
          |> Keyword.put(:proxy_port, if(port == "0", do: 0, else: String.to_integer(port) + 1))
 end
 
+# Cluster peers, e.g. MAILSTORE_CLUSTER_NODES="ms1@10.0.0.1,ms2@10.0.0.2" (start each node
+# with --name and the same --cookie).
+if nodes = System.get_env("MAILSTORE_CLUSTER_NODES") do
+  config :mailstore, :cluster,
+    nodes: nodes |> String.split(",", trim: true) |> Enum.map(&String.to_atom/1)
+end
+
 # Inbound queue, e.g. MAILSTORE_KAFKA_HOSTS="kfk1:9092,kfk2:9092".
 if hosts = System.get_env("MAILSTORE_KAFKA_HOSTS") do
   hosts =

@@ -9,6 +9,7 @@ defmodule Mailstore.Application do
         Mailstore.Telemetry,
         Mailstore.Repo,
         Mailstore.Directory.Cache,
+        Mailstore.Cluster,
         Mailstore.Mailbox.Supervisor
       ] ++
         if(Mailstore.Imap.enabled?(), do: [Mailstore.Imap], else: []) ++

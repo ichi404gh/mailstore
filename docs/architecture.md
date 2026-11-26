@@ -62,7 +62,7 @@ flowchart LR
 
 ## 2. Дерево процессов BEAM-ноды
 
-На каждое активное соединение — процесс `Imap.Connection`, на каждый активный аккаунт — один актор `AccountServer`, сколько бы сессий его ни открыло. Актор живёт, пока есть подписчики, и ещё `account_idle_timeout` после них. Для открытых папок он держит в памяти все UID и непрочитанные (диапазонами, `Core.UidMap`) и обновляет их на каждой своей записи, поэтому SELECT и UNSEEN не ходят в базу.
+На каждое активное соединение — процесс `Imap.Connection`, на каждый активный аккаунт — один актор `AccountServer` во всём кластере, сколько бы сессий на скольких нодах его ни открыло. Актор работает на ноде-владельце (`Mailbox.Placement`: rendezvous-хеширование по `account_id` среди нод группы `:pg`), вызовы с других нод приходят через `:erpc`, а push-уведомления уходят сессиям на любой ноде. При смене состава кластера нода останавливает акторы ящиков, которые ей больше не принадлежат, и их сессии переподписываются у нового владельца. Актор живёт, пока есть подписчики, и ещё `account_idle_timeout` после них. Для открытых папок он держит в памяти все UID и непрочитанные (диапазонами, `Core.UidMap`) и обновляет их на каждой своей записи, поэтому SELECT и UNSEEN не ходят в базу.
 
 ```mermaid
 flowchart TB
@@ -76,12 +76,17 @@ flowchart TB
 
   app --> dc["Directory.Cache<br/>владелец ETS:<br/>accounts, addresses,<br/>forwardings, auth"]
 
+  app --> cl["Cluster"]
+  cl --> pg[":pg scope :mailstore<br/>члены кластера"]
+  cl --> con["Connector<br/>подключение к нодам"]
+
   app --> ms["Mailbox.Supervisor"]
   ms --> reg["Registry<br/>account_id → pid"]
   ms --> asup["AccountSupervisor<br/>DynamicSupervisor"]
   asup --> a1["AccountServer<br/>аккаунт 1"]
   asup --> a2["AccountServer<br/>аккаунт N"]
   ms --> pm["PartitionMaintainer<br/>недельные партиции,<br/>дни deliveries"]
+  ms --> place["Placement<br/>нода-владелец ящика,<br/>передача при смене состава"]
 
   app --> ing["Ingest<br/>(если включён)"]
   ing --> dl["brod-клиент<br/>dead-letter топика"]
