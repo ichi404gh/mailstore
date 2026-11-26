@@ -1,7 +1,7 @@
-# Synthetic records in the format of mailhub_relay_sender_in.* (see Mailstore.Ingest.Record):
+# Synthetic records in the format of the inbound topic (see Mailstore.Ingest.Record):
 #
 #   mix run --no-start bench/ingest/produce.exs -- --count 100000 [--rate 0] [--users 5000]
-#     [--domain load.test] [--topic mailhub_relay_sender_in.basic] [--unknown 0.01]
+#     [--domain load.test] [--topic mailstore.inbound] [--unknown 0.01]
 #     [--seed 1] [--hosts localhost:9092]
 #
 # --rate 0 = as fast as possible (a backlog); otherwise records per second. Recipients
@@ -9,7 +9,7 @@
 # --to sends everything to one address.
 # Each message is unique (Message-ID with --seed and the index); 70% are warmup. The raw
 # message is ~4 KB like a real one (authentication results, DKIM, two Received hops,
-# multipart/alternative); the record also carries the decoded body twice, as upstream does.
+# multipart/alternative); the record also carries the decoded body twice.
 {opts, _, _} =
   OptionParser.parse(Enum.reject(System.argv(), &(&1 == "--")),
     strict: [
@@ -29,7 +29,7 @@ count = opts[:count] || 100_000
 rate = opts[:rate] || 0
 users = opts[:users] || 5_000
 domain = opts[:domain] || "load.test"
-topic = opts[:topic] || "mailhub_relay_sender_in.basic"
+topic = opts[:topic] || "mailstore.inbound"
 unknown = opts[:unknown] || 0.01
 seed = opts[:seed] || 1
 
@@ -99,33 +99,24 @@ record = fn i ->
 
   warmup = :rand.uniform() < 0.7
 
+  # The fields Mailstore.Ingest.Record reads, plus decoded copies of the body: producers
+  # often carry such extras, and they make the record as heavy as a real one.
   json =
     Jason.encode!(%{
       message_id: msg_id,
-      mailpit_id: nil,
       message_received_ts: DateTime.to_iso8601(now),
       sender_email: "ella@sender.example",
-      original_sender_email: "ella@sender.example",
       rcp_email: rcpt,
-      all_recipients: [rcpt],
-      server_name: "mailhub://#{1000 + rem(i, 30)}",
-      notification_sent: false,
-      is_sent: false,
-      ts: DateTime.to_iso8601(DateTime.utc_now()),
       subject: "Looking forward to working together. | #{i}",
-      email_html: "<p>" <> body <> "</p>",
-      email_body: body,
-      message_headers: "{}",
-      is_warmup: warmup,
-      is_followup: false,
+      text: body,
+      html: "<p>" <> body <> "</p>",
+      is_warmup: :rand.uniform() < 0.7,
       is_spamtest: false,
-      envelope_content: raw,
-      user_id: nil,
-      wrmp_srv_name: if(warmup, do: "instantly")
+      envelope_content: raw
     })
 
   if String.starts_with?(rcpt, "user"), do: :counters.add(known, 1, 1)
-  {"mailhub://#{1000 + rem(i, 30)}", json}
+  {"mx#{rem(i, 30)}", json}
 end
 
 # Send in chunks; with --rate, pace each chunk.

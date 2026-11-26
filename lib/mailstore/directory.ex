@@ -10,6 +10,7 @@ defmodule Mailstore.Directory do
   This module is the context's public API; `Directory.Schemas.*` and
   `Directory.Queries` are internal.
   """
+  import Ecto.Query, only: [from: 2]
   alias Mailstore.{Mailbox, Repo}
   alias Mailstore.Directory.{Cache, Password, Queries}
   alias Mailstore.Core.Rules
@@ -17,9 +18,20 @@ defmodule Mailstore.Directory do
 
   ## Tenants and domains
 
-  def create_tenant(attrs), do: %Tenant{} |> Tenant.changeset(Map.new(attrs)) |> Repo.insert()
+  def create_tenant(attrs) do
+    with {:ok, tenant} <- %Tenant{} |> Tenant.changeset(Map.new(attrs)) |> Repo.insert() do
+      :ok = Cache.put_tenant(tenant)
+      {:ok, tenant}
+    end
+  end
 
   def get_tenant!(id), do: Repo.get!(Tenant, id)
+
+  @doc "The shard a tenant's mail lives on (`Mailstore.Shards`): from the cache, else the database."
+  def shard_of(tenant_id) do
+    (Cache.loaded?() && Cache.tenant_shard(tenant_id)) ||
+      Repo.one!(from(t in Tenant, where: t.id == ^tenant_id, select: t.shard))
+  end
 
   def create_domain(%Tenant{id: tenant_id}, name) do
     %Domain{} |> Domain.changeset(%{tenant_id: tenant_id, name: name}) |> Repo.insert()

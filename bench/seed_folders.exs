@@ -10,7 +10,7 @@
 # older messages at random (holes in the UID sequence), --delete-every-other removes
 # every even UID (the worst case for range storage). Counters in `folders` are fixed up.
 # Only metadata rows are inserted (no bodies): enough for SELECT/IDLE memory tests.
-alias Mailstore.{Directory, Repo}
+alias Mailstore.{Directory, Repo, Shards}
 
 {opts, _, _} =
   OptionParser.parse(Enum.reject(System.argv(), &(&1 == "--")),
@@ -37,13 +37,16 @@ domain =
 )
 |> Stream.run()
 
+# Accounts are in the directory; folders and messages on the tenant's shard.
 %{rows: [[account_ids]]} =
   Repo.query!("SELECT array_agg(id) FROM accounts WHERE domain_id = $1", [domain.id])
+
+shard = Shards.repo(domain.tenant_id)
 
 inbox = "SELECT id FROM folders WHERE account_id = ANY($1) AND name = 'INBOX'"
 
 recount = fn ->
-  Repo.query!(
+  shard.query!(
     """
     UPDATE folders f
     SET messages_count = s.cnt, unseen_count = s.unseen,
@@ -65,7 +68,7 @@ end
 if n = opts[:fill] do
   {us, %{num_rows: rows}} =
     :timer.tc(fn ->
-      Repo.query!(
+      shard.query!(
         """
         INSERT INTO messages (tenant_id, folder_id, uid, modseq, stored_at, internal_date, size,
                               flags, keywords, class, message_id, from_addr, subject)
@@ -88,7 +91,7 @@ end
 
 if p = opts[:delete_fraction] do
   %{num_rows: rows} =
-    Repo.query!(
+    shard.query!(
       "DELETE FROM messages WHERE folder_id IN (#{inbox}) AND (flags & 1) <> 0 AND random() < $2",
       [account_ids, p],
       timeout: :infinity
@@ -100,7 +103,7 @@ end
 
 if opts[:delete_every_other] do
   %{num_rows: rows} =
-    Repo.query!(
+    shard.query!(
       "DELETE FROM messages WHERE folder_id IN (#{inbox}) AND uid % 2 = 0",
       [account_ids],
       timeout: :infinity
@@ -111,7 +114,7 @@ if opts[:delete_every_other] do
 end
 
 %{rows: [[folders, msgs, avg_runs]]} =
-  Repo.query!(
+  shard.query!(
     """
     SELECT count(*), COALESCE(sum(n), 0), round(avg(runs), 1)
     FROM (

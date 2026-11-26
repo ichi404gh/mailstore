@@ -1,6 +1,6 @@
 defmodule Mailstore.Mailbox.DeliverTest do
   use Mailstore.DataCase, async: false
-  alias Mailstore.{Mailbox, Repo}
+  alias Mailstore.Mailbox
   alias Mailstore.Mailbox.{AccountServer, Commands, Partitions}
 
   setup do
@@ -22,7 +22,7 @@ defmodule Mailstore.Mailbox.DeliverTest do
   defp key, do: :crypto.strong_rand_bytes(16)
 
   defp counters(account) do
-    Repo.query!(
+    shard_repo(account).query!(
       "SELECT uidnext, messages_count, unseen_count FROM folders WHERE id = $1",
       [folder_id(account, "INBOX")]
     ).rows
@@ -31,7 +31,8 @@ defmodule Mailstore.Mailbox.DeliverTest do
   # Commit without telling the actors: a writer whose notification is still on its way.
   defp commit_silently(items) do
     items = Enum.map(items, &Map.put(&1, :folder, "INBOX"))
-    {:ok, {_results, updates}} = Repo.transaction(fn -> Commands.deliver(Repo, items) end)
+    repo = shard_repo(%{tenant_id: hd(items).tenant_id})
+    {:ok, {_results, updates}} = repo.transaction(fn -> Commands.deliver(repo, items) end)
     updates
   end
 
@@ -87,7 +88,7 @@ defmodule Mailstore.Mailbox.DeliverTest do
   test "a key recorded on an earlier day is still a duplicate", %{a: a} do
     k = key()
 
-    Repo.query!(
+    shard_repo(a).query!(
       "INSERT INTO deliveries (account_id, key, created_at) VALUES ($1, $2, now() - interval '1 day')",
       [a.id, k]
     )
@@ -136,13 +137,13 @@ defmodule Mailstore.Mailbox.DeliverTest do
 
   test "dedup horizon: days before the cutoff are dropped" do
     today = Date.utc_today()
-    Partitions.ensure()
+    Mailbox.ensure_partitions()
     tomorrow = "deliveries_" <> Calendar.strftime(Date.add(today, 1), "%Y%m%d")
     yesterday = "deliveries_" <> Calendar.strftime(Date.add(today, -1), "%Y%m%d")
 
-    dropped = Partitions.drop_deliveries_before(today)
+    dropped = Partitions.drop_deliveries_before(Mailstore.Shards.repo_for(1), today)
     assert yesterday in dropped
     refute tomorrow in dropped
-    Partitions.ensure()
+    Mailbox.ensure_partitions()
   end
 end

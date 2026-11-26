@@ -12,7 +12,7 @@ defmodule Mailstore.Repo.Migrations.CreateDirectory do
     # tenant = a customer account. Its shard is the unit of data placement.
     create table(:tenants) do
       add :name, :text, null: false
-      add :shard, :smallint, null: false, default: 0
+      add :shard, :integer, null: false, default: 1
       timestamps()
     end
 

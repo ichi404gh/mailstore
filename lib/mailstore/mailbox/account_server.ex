@@ -168,6 +168,17 @@ defmodule Mailstore.Mailbox.AccountServer do
     end
   end
 
+  @doc false
+  # A tenant moved to another shard: its actors here hold the old shard's repo.
+  def stop_local(account_ids) do
+    for id <- account_ids,
+        pid = whereis(id),
+        pid != nil,
+        do: DynamicSupervisor.terminate_child(@supervisor, pid)
+
+    :ok
+  end
+
   @doc "Ask every actor in the cluster to reload folder state (after retention jobs)."
   def reload_all do
     for n <- Placement.members(), n != node(), do: :erpc.cast(n, __MODULE__, :reload_local, [])
@@ -185,19 +196,34 @@ defmodule Mailstore.Mailbox.AccountServer do
   # To the owner node. If it has just gone away, wait for the members to update and
   # ask the new owner. (A write that reached a node which then died may be repeated:
   # a duplicate is the lesser evil than a lost APPEND.)
-  defp call(account_id, msg, attempts \\ 5) do
+  defp call(account_id, msg, attempts \\ 5, moved \\ 30) do
     owner = Placement.owner(account_id)
 
-    if owner == node() do
-      local_call(account_id, msg)
-    else
-      try do
-        :erpc.call(owner, __MODULE__, :local_call, [account_id, msg], @call_timeout + 1_000)
-      catch
-        :error, {:erpc, :noconnection} when attempts > 1 ->
-          Process.sleep(200)
-          call(account_id, msg, attempts - 1)
+    result =
+      if owner == node() do
+        local_call(account_id, msg)
+      else
+        try do
+          :erpc.call(owner, __MODULE__, :local_call, [account_id, msg], @call_timeout + 1_000)
+        catch
+          :error, {:erpc, :noconnection} when attempts > 1 ->
+            Process.sleep(200)
+            {:retry, :noconnection}
+        end
       end
+
+    case result do
+      {:retry, :noconnection} ->
+        call(account_id, msg, attempts - 1, moved)
+
+      # The tenant moved to another shard: until the directory switch is visible the
+      # write keeps hitting the fenced old shard, so wait a little between tries.
+      {:error, :tenant_moved} when moved > 1 ->
+        Process.sleep(100)
+        call(account_id, msg, attempts, moved - 1)
+
+      other ->
+        other
     end
   end
 
@@ -208,7 +234,11 @@ defmodule Mailstore.Mailbox.AccountServer do
     case ensure(account_id) do
       {:ok, pid} ->
         try do
-          GenServer.call(pid, msg, @call_timeout)
+          with {:error, :tenant_moved} = moved <- GenServer.call(pid, msg, @call_timeout) do
+            # Look the tenant's shard up again here, where the next actor will start.
+            Mailstore.Directory.Cache.refresh()
+            moved
+          end
         catch
           :exit, {reason, _} when attempts > 1 ->
             if stopping?(reason),
@@ -511,6 +541,7 @@ defmodule Mailstore.Mailbox.AccountServer do
   end
 
   def handle_info({:EXIT, _pid, _reason}, st), do: noreply(st)
+  def handle_info(:tenant_moved, st), do: {:stop, {:shutdown, :tenant_moved}, st}
 
   @impl true
   def terminate(_reason, st) do
@@ -545,6 +576,12 @@ defmodule Mailstore.Mailbox.AccountServer do
   defp tx(st, fun) do
     st.repo.transaction(fun)
   rescue
+    Mailstore.Shards.TenantMoved ->
+      # This actor's repo is the old shard: stop after replying; the caller retries
+      # and the next actor starts on the tenant's new shard.
+      send(self(), :tenant_moved)
+      {:error, :tenant_moved}
+
     e in [Postgrex.Error, DBConnection.ConnectionError] ->
       Logger.error("account #{st.account_id}: #{Exception.message(e)}")
       {:error, e}

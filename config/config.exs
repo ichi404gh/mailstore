@@ -36,7 +36,8 @@ config :mailstore, :directory_cache,
 config :mailstore, :ingest,
   enabled: false,
   hosts: [localhost: 9092],
-  topics: ["mailhub_relay_sender_in.basic", "mailhub_relay_sender_in.priority"],
+  # E.g. a normal and a priority lane: both are consumed by one pipeline.
+  topics: ["mailstore.inbound", "mailstore.inbound.priority"],
   group_id: "mailstore-ingest",
   # Where a new consumer group starts. Replays are harmless (idempotent writes).
   offset_reset_policy: :latest,

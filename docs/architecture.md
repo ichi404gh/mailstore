@@ -22,7 +22,7 @@ flowchart LR
   end
 
   smtp["Входящий SMTP<br/>проверка RCPT TO"]:::planned
-  queue[("Kafka<br/>mailhub_relay_sender_in<br/>.basic / .priority")]
+  queue[("Kafka<br/>mailstore.inbound<br/>(+ .priority)")]
 
   hap["HAProxy × N<br/>:993, неявный TLS"]
 
@@ -35,7 +35,7 @@ flowchart LR
 
   subgraph storage["Шарды Postgres (Patroni + PgBouncer)"]
     s1[("шард 1<br/>primary + реплика")]
-    s2[("шард N<br/>primary + реплика")]:::planned
+    s2[("шард N<br/>primary + реплика")]
   end
 
   obj[("Объектное хранилище<br/>тела закрытых недель")]:::planned
@@ -224,7 +224,7 @@ sequenceDiagram
 
 ## 6. Схема данных
 
-Directory — одна глобальная база (в прототипе — та же, что и шард). Шард хранит почту своих tenants. Внешних ключей между ними нет: в целевой схеме это разные базы.
+Справочник (directory) — одна глобальная база со своей схемой (`priv/repo/migrations`): tenants, домены, ящики, правила, реестр шардов. Каждый шард — отдельная база со схемой шарда (`priv/shard/migrations`), в ней почта своих tenants. Внешних ключей и общих транзакций между ними нет. В разработке это базы одного сервера Postgres (`mailstore_dev`, `mailstore_dev_shard1`, ...). На диаграмме ниже обе схемы вместе, связи между ними логические.
 
 ```mermaid
 erDiagram
@@ -237,7 +237,7 @@ erDiagram
   tenants {
     bigint id PK
     text name
-    smallint shard "шард всех данных tenant"
+    int shard FK "шард всех данных tenant (shards.id)"
   }
   domains {
     bigint id PK
@@ -265,6 +265,7 @@ erDiagram
     boolean enabled
   }
 
+  shards ||--o{ tenants : "где живёт почта"
   folders ||--o{ messages : "UID-пространство"
   messages ||--|| message_bodies : "тело"
   folders ||--o{ vanished : "удалённые UID"
@@ -277,6 +278,7 @@ erDiagram
     bigint uidvalidity
     bigint uidnext "выдача UID"
     bigint recent_uid "первый не забранный как Recent"
+    boolean fenced "tenant перенесён на другой шард"
     bigint highest_modseq
     bigint retained_from_uid "ниже — удалено по сроку"
     int messages_count

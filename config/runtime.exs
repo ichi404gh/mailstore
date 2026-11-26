@@ -86,6 +86,12 @@ if hosts = System.get_env("MAILSTORE_KAFKA_HOSTS") do
   config :mailstore, :ingest, ingest
 end
 
+# A single-shard production install: the shard's database (created and owned by the
+# platform, not by mailstore); further shards are added with Mailstore.Shards.register/3.
+if url = System.get_env("MAILSTORE_SHARD1_URL") do
+  config :mailstore, :bootstrap_shards, [%{name: "shard1", url: url}]
+end
+
 if config_env() == :prod do
   config :mailstore, Mailstore.Repo,
     url: System.fetch_env!("DATABASE_URL"),

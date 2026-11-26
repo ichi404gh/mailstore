@@ -1,4 +1,4 @@
-defmodule Mailstore.Repo.Migrations.CreateDeliveries do
+defmodule Mailstore.Shard.Migrations.CreateDeliveries do
   @moduledoc """
   Deliveries already stored, for idempotent ingest: a message replayed from Kafka (a
   restart before the offset commit, a DLQ replay, a producer retry) is recognized by

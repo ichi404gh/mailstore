@@ -21,6 +21,9 @@ defmodule Mailstore.Fixtures do
     account
   end
 
+  @doc "The repo of the shard an account's mail lives on."
+  def shard_repo(account), do: Mailstore.Shards.repo(account.tenant_id)
+
   def folder_id(account, name) do
     account.tenant_id
     |> Mailbox.list_folders(account.id)

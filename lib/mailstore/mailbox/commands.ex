@@ -10,6 +10,11 @@ defmodule Mailstore.Mailbox.Commands do
   two writers on the same folder (for example two actors during a netsplit) still get
   disjoint UID ranges. The actor only batches writes and fans out notifications.
 
+  Fencing: when a tenant moves to another shard (`Mailstore.Shards.Move`), its folders
+  on the old shard are marked `fenced`. Every write locks its folder row, sees the mark
+  and raises `Mailstore.Shards.TenantMoved`; the caller looks the shard up again and
+  retries there.
+
   Each function returns the folder counters after the change (or `nil` if nothing
   changed) so the actor can refresh its in-memory view without another query.
   """
@@ -18,6 +23,7 @@ defmodule Mailstore.Mailbox.Commands do
   alias Mailstore.Mailbox.Schemas.{Message, MessageBody}
 
   @counters "uidnext, highest_modseq, messages_count, unseen_count"
+  @move_lock 7001
 
   @doc "Append messages to a folder. Returns {uids, counters}."
   def append(repo, folder_id, tenant_id, msgs, opts \\ []) when msgs != [] do
@@ -25,18 +31,19 @@ defmodule Mailstore.Mailbox.Commands do
     n = length(msgs)
     unseen = Enum.count(msgs, &(not Flags.seen?(&1.flags_mask)))
 
-    %{rows: [row]} =
+    row =
       repo.query!(
         """
         UPDATE folders
         SET uidnext = uidnext + $2, highest_modseq = highest_modseq + $2,
             messages_count = messages_count + $2, unseen_count = unseen_count + $3,
             updated_at = now()
-        WHERE id = $1
+        WHERE id = $1 AND NOT fenced
         RETURNING #{@counters}
         """,
         [folder_id, n, unseen]
       )
+      |> one_unfenced!()
 
     counters = counters(row)
     first_uid = counters.uidnext - n
@@ -202,7 +209,7 @@ defmodule Mailstore.Mailbox.Commands do
     %{rows: rows} =
       repo.query!(
         """
-        SELECT f.id, f.account_id, f.name
+        SELECT f.id, f.account_id, f.name, f.fenced
         FROM folders f JOIN unnest($1::bigint[], $2::text[]) AS v(a, n)
           ON f.account_id = v.a AND f.name = v.n
         ORDER BY f.id
@@ -211,7 +218,8 @@ defmodule Mailstore.Mailbox.Commands do
         [accounts, names]
       )
 
-    Map.new(rows, fn [id, account_id, name] -> {{account_id, name}, id} end)
+    if Enum.any?(rows, &List.last/1), do: moved!()
+    Map.new(rows, fn [id, account_id, name, _fenced] -> {{account_id, name}, id} end)
   end
 
   # One UPDATE for all folders: %{folder_id => counters after the batch}.
@@ -424,18 +432,19 @@ defmodule Mailstore.Mailbox.Commands do
       k = length(src_uids)
       unseen = Enum.count(src, fn [_uid, flags] -> unseen_bit(flags) == 1 end)
 
-      %{rows: [row]} =
+      row =
         repo.query!(
           """
           UPDATE folders
           SET uidnext = uidnext + $2, highest_modseq = highest_modseq + $2,
               messages_count = messages_count + $2, unseen_count = unseen_count + $3,
               updated_at = now()
-          WHERE id = $1
+          WHERE id = $1 AND NOT fenced
           RETURNING #{@counters}
           """,
           [dst_folder_id, k, unseen]
         )
+        |> one_unfenced!()
 
       counters = counters(row)
       first_uid = counters.uidnext - k
@@ -476,6 +485,16 @@ defmodule Mailstore.Mailbox.Commands do
   New folders are not subscribed: clients subscribe themselves (as with Dovecot).
   """
   def create_folders(repo, tenant_id, account_id, names) when names != [] do
+    # New rows lock nothing: a tenant move takes this lock exclusively instead.
+    repo.query!("SELECT pg_advisory_xact_lock_shared(#{@move_lock}, $1::int)", [tenant_id])
+
+    %{rows: [[fenced]]} =
+      repo.query!("SELECT EXISTS (SELECT 1 FROM folders WHERE account_id = $1 AND fenced)", [
+        account_id
+      ])
+
+    if fenced, do: moved!()
+
     repo.query!(
       """
       INSERT INTO folders (tenant_id, account_id, name, uidvalidity, subscribed, inserted_at, updated_at)
@@ -491,12 +510,15 @@ defmodule Mailstore.Mailbox.Commands do
 
   @doc "SUBSCRIBE / UNSUBSCRIBE. Subscriptions belong to existing folders only."
   def set_subscribed(repo, folder_id, on?) do
+    lock_next_modseq(repo, folder_id)
     repo.query!("UPDATE folders SET subscribed = $2 WHERE id = $1", [folder_id, on?])
     :ok
   end
 
   @doc "DELETE: the folder with all its messages, bodies and expunge log."
   def delete_folder(repo, folder_id) do
+    lock_next_modseq(repo, folder_id)
+
     for table <- ["message_bodies", "messages", "vanished"],
         do: repo.query!("DELETE FROM #{table} WHERE folder_id = $1", [folder_id])
 
@@ -509,6 +531,18 @@ defmodule Mailstore.Mailbox.Commands do
   UIDVALIDITY stay. Returns [{folder_id, new_name}].
   """
   def rename_folder(repo, account_id, old, new) do
+    %{rows: locked} =
+      repo.query!(
+        """
+        SELECT fenced FROM folders
+        WHERE account_id = $1 AND (name = $2 OR starts_with(name, $2 || '/'))
+        FOR UPDATE
+        """,
+        [account_id, old]
+      )
+
+    if Enum.any?(locked, &hd/1), do: moved!()
+
     %{rows: rows} =
       repo.query!(
         """
@@ -523,12 +557,25 @@ defmodule Mailstore.Mailbox.Commands do
     Enum.map(rows, fn [id, name] -> {id, name} end)
   end
 
+  # The folder row lock every write takes; a fenced folder (tenant moved away) refuses.
   defp lock_next_modseq(repo, folder_id) do
-    %{rows: [[next]]} =
-      repo.query!("SELECT highest_modseq + 1 FROM folders WHERE id = $1 FOR UPDATE", [folder_id])
+    %{rows: [[next, fenced]]} =
+      repo.query!("SELECT highest_modseq + 1, fenced FROM folders WHERE id = $1 FOR UPDATE", [
+        folder_id
+      ])
 
+    if fenced, do: moved!()
     next
   end
+
+  defp one_unfenced!(%{rows: [row]}), do: row
+  defp one_unfenced!(%{rows: []}), do: moved!()
+
+  defp moved!,
+    do: raise(Mailstore.Shards.TenantMoved, "the tenant was moved to another shard")
+
+  @doc "Advisory lock class of tenant moves (`Mailstore.Shards.Move`)."
+  def move_lock, do: @move_lock
 
   defp update_counters(repo, folder_id, set_sql, params) do
     %{rows: [row]} =

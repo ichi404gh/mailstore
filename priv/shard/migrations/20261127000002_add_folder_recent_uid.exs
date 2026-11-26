@@ -1,4 +1,4 @@
-defmodule Mailstore.Repo.Migrations.AddFolderRecentUid do
+defmodule Mailstore.Shard.Migrations.AddFolderRecentUid do
   @moduledoc """
   First UID not yet claimed as \\Recent (Dovecot keeps the same, `first_recent_uid`, in
   its index). Delivery no longer goes through the account actor, so an actor that

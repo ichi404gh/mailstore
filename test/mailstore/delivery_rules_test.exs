@@ -22,7 +22,7 @@ defmodule Mailstore.DeliveryRulesTest do
   end
 
   defp class_of(account) do
-    Repo.query!("SELECT class FROM messages WHERE folder_id = $1 ORDER BY uid", [
+    shard_repo(account).query!("SELECT class FROM messages WHERE folder_id = $1 ORDER BY uid", [
       folder_id(account, "INBOX")
     ]).rows
     |> List.flatten()

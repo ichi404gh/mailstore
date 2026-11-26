@@ -108,7 +108,7 @@ defmodule Mailstore.Mailbox.AccountServerTest do
     assert UidMap.to_list(view.uids) == [1, 2]
 
     # A retention job removes rows behind the actor's back, then asks for a reload.
-    Mailstore.Repo.query!("DELETE FROM messages WHERE uid = 1")
+    shard_repo(a).query!("DELETE FROM messages WHERE uid = 1")
     :ok = AccountServer.reload_all()
     {:ok, _, view} = Mailbox.subscribe(a.id, "INBOX")
     assert UidMap.to_list(view.uids) == [2]

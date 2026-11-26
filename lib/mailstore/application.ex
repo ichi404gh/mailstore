@@ -8,6 +8,8 @@ defmodule Mailstore.Application do
       [
         Mailstore.Telemetry,
         Mailstore.Repo,
+        {DynamicSupervisor, name: Mailstore.Shards.RepoSupervisor, strategy: :one_for_one},
+        Mailstore.Shards.Registry,
         Mailstore.Directory.Cache,
         Mailstore.Cluster,
         Mailstore.Mailbox.Supervisor

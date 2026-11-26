@@ -92,19 +92,38 @@ defmodule Mailstore.Mailbox do
     items
     |> Enum.map(&Map.put_new(&1, :folder, "INBOX"))
     |> Enum.with_index()
-    |> Enum.group_by(fn {item, _i} -> Shards.repo(item.tenant_id) end)
-    |> Enum.flat_map(fn {repo, group} ->
-      {items, indexes} = Enum.unzip(group)
-      {results, updates} = deliver_tx(repo, items, 3)
-      for u <- updates, do: AccountServer.delivered(u.account_id, u)
-
-      Enum.zip_with([indexes, items, results], fn [i, item, result] ->
-        {i, result(item, result)}
-      end)
-    end)
+    |> deliver_groups(30)
     |> Enum.sort_by(&elem(&1, 0))
     |> Enum.map(&elem(&1, 1))
     |> then(&{:ok, &1})
+  end
+
+  # One transaction per shard. A group that hits a tenant moved away (fenced folders)
+  # is rolled back; its items are grouped again once the directory says where they
+  # live now.
+  defp deliver_groups(indexed, attempts) do
+    indexed
+    |> Enum.group_by(fn {item, _i} -> Shards.repo(item.tenant_id) end)
+    |> Enum.flat_map(fn {repo, group} ->
+      {items, indexes} = Enum.unzip(group)
+
+      case deliver_tx(repo, items, 3) do
+        {results, updates} ->
+          for u <- updates, do: AccountServer.delivered(u.account_id, u)
+
+          Enum.zip_with([indexes, items, results], fn [i, item, result] ->
+            {i, result(item, result)}
+          end)
+
+        :tenant_moved when attempts > 1 ->
+          Mailstore.Directory.Cache.refresh()
+          Process.sleep(100)
+          deliver_groups(group, attempts - 1)
+
+        :tenant_moved ->
+          raise Mailstore.Shards.TenantMoved, "tenant still fenced after retries"
+      end
+    end)
   end
 
   # A deadlock (with an actor's MOVE locking two folders) or a serialization failure
@@ -113,6 +132,9 @@ defmodule Mailstore.Mailbox do
     {:ok, result} = repo.transaction(fn -> Commands.deliver(repo, items) end)
     result
   rescue
+    Mailstore.Shards.TenantMoved ->
+      :tenant_moved
+
     e in Postgrex.Error ->
       if attempts > 1 and e.postgres[:code] in [:deadlock_detected, :serialization_failure],
         do: deliver_tx(repo, items, attempts - 1),
@@ -215,8 +237,21 @@ defmodule Mailstore.Mailbox do
 
   ## Retention
 
-  defdelegate ensure_partitions(), to: Partitions, as: :ensure
-  defdelegate drop_partitions_before(cutoff), to: Partitions, as: :drop_before
+  @doc "Make sure partitions exist on every shard."
+  def ensure_partitions, do: Enum.each(Shards.all(), &Partitions.ensure/1)
+
+  @doc "Retention: drop the weeks that end before `cutoff`, on every shard."
+  def drop_partitions_before(cutoff) do
+    Shards.all()
+    |> Enum.map(fn repo -> elem(Partitions.drop_before(repo, cutoff), 1) end)
+    |> Enum.reduce(%{dropped: [], affected_folders: []}, fn r, acc ->
+      %{
+        dropped: acc.dropped ++ r.dropped,
+        affected_folders: acc.affected_folders ++ r.affected_folders
+      }
+    end)
+    |> then(&{:ok, &1})
+  end
 
   defp run(tenant_id, fun, query), do: apply(Shards.repo(tenant_id), fun, [query])
 end

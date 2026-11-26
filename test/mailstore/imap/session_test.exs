@@ -264,7 +264,7 @@ defmodule Mailstore.Imap.SessionTest do
 
     test "a row stored before MIME parsing gets its tree from the body" do
       deliver(body: "short")
-      Mailstore.Repo.query!("UPDATE messages SET bodystructure = NULL")
+      Mailstore.Shards.repo_for(1).query!("UPDATE messages SET bodystructure = NULL")
       {out, _} = cmd(selected(), "a1 FETCH 1 (BODY BODY.PEEK[1])")
 
       assert out =~

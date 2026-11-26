@@ -1,22 +1,20 @@
 defmodule Mailstore.Ingest.Record do
   @moduledoc """
-  One message of the inbound topics (`mailhub_relay_sender_in.basic` / `.priority`), as
-  the SMTP layer writes it: JSON, one message per recipient.
+  One message of the inbound topic, as the SMTP layer writes it: a JSON object, one
+  per recipient (fan-out to recipients happens upstream).
 
-  Used fields:
+  Fields:
 
     * `envelope_content` - the message as received (RFC 5322, with `Received:` headers);
-    * `rcp_email` - the recipient (`all_recipients` is informational: fan-out to
-      recipients already happened upstream);
-    * `message_received_ts` - when SMTP accepted it, becomes INTERNALDATE;
-    * `is_spamtest`, `is_warmup` - the class.
+    * `rcp_email` - the recipient;
+    * `message_received_ts` - when SMTP accepted it (ISO 8601), becomes INTERNALDATE;
+    * `is_spamtest`, `is_warmup` - the class, as classified upstream.
 
-  Everything else (decoded duplicates of the body in `email_body` / `email_html`,
-  sender rotation, relay bookkeeping) is ignored.
+  Any other field is ignored, so producers can carry their own bookkeeping.
 
   `key` identifies the delivery for idempotent ingest: SHA-256 of the recipient and the
   raw bytes, cut to 128 bits. The same record replayed (restart before the offset
-  commit, DLQ replay, producer retry, the same message in both topics) has the same key.
+  commit, DLQ replay, producer retry, the same message in two topics) has the same key.
   A message the sending MTA itself sent twice differs in its `Received:` headers and is
   stored twice, as any mail server would.
   """

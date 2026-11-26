@@ -5,14 +5,13 @@ defmodule Mailstore.Mailbox.Partitions do
   Prototype: one retention class. Production: partition by retention class too
   (warmup 14 days, standard 365), so warmup weeks can be dropped early.
   """
-  alias Mailstore.Repo
   alias Mailstore.Mailbox.AccountServer
 
   @doc """
   Make sure partitions exist: weekly message partitions from last week up to `weeks`
   ahead, daily `deliveries` partitions from yesterday a week ahead.
   """
-  def ensure(repo \\ Repo, from \\ Date.add(Date.utc_today(), -7), weeks \\ 12) do
+  def ensure(repo, from \\ Date.add(Date.utc_today(), -7), weeks \\ 12) do
     repo.query!("SELECT mailstore_ensure_partitions($1, $2)", [from, weeks])
 
     repo.query!("SELECT mailstore_ensure_delivery_partitions($1, $2)", [
@@ -28,7 +27,7 @@ defmodule Mailstore.Mailbox.Partitions do
   longer than anything can be replayed from, i.e. the retention of the source topics.
   Returns the dropped partitions.
   """
-  def drop_deliveries_before(repo \\ Repo, %Date{} = cutoff) do
+  def drop_deliveries_before(repo, %Date{} = cutoff) do
     %{rows: rows} =
       repo.query!("""
       SELECT c.relname
@@ -46,7 +45,7 @@ defmodule Mailstore.Mailbox.Partitions do
   end
 
   @doc "messages partitions whose upper bound is <= cutoff."
-  def list_before(repo \\ Repo, %DateTime{} = cutoff) do
+  def list_before(repo, %DateTime{} = cutoff) do
     %{rows: rows} =
       repo.query!(
         """
@@ -70,7 +69,7 @@ defmodule Mailstore.Mailbox.Partitions do
   Production would DETACH PARTITION CONCURRENTLY first to avoid an exclusive lock on
   the parent table.
   """
-  def drop_before(repo \\ Repo, %DateTime{} = cutoff) do
+  def drop_before(repo, %DateTime{} = cutoff) do
     names = list_before(repo, cutoff)
 
     {:ok, affected} =

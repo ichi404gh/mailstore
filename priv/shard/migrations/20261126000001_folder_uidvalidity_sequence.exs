@@ -1,4 +1,4 @@
-defmodule Mailstore.Repo.Migrations.FolderUidvaliditySequence do
+defmodule Mailstore.Shard.Migrations.FolderUidvaliditySequence do
   @moduledoc """
   UIDVALIDITY of new folders comes from a sequence, not from the clock.
 

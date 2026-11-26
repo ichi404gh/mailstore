@@ -4,23 +4,18 @@ defmodule Mailstore.Ingest.RecordTest do
 
   @raw "From: a@example.org\r\nTo: Bob@Acme.test\r\nSubject: hi\r\n\r\nbody\r\n"
 
-  # Same shape as mailhub_relay_sender_in.* (synthetic values).
+  # A record as the SMTP layer writes it, with a few fields ingest does not use.
   def record(overrides \\ %{}) do
     %{
       "message_id" => "<m1@example.org>",
       "message_received_ts" => "2026-11-26T10:02:51+00:00",
       "sender_email" => "a@example.org",
       "rcp_email" => "Bob@Acme.test",
-      "all_recipients" => ["Bob@Acme.test"],
-      "server_name" => "mailhub://1025",
       "subject" => "hi",
-      "email_body" => "body",
-      "email_html" => "",
+      "text" => "body",
       "is_warmup" => false,
-      "is_followup" => false,
       "is_spamtest" => false,
-      "envelope_content" => @raw,
-      "wrmp_srv_name" => nil
+      "envelope_content" => @raw
     }
     |> Map.merge(overrides)
     |> Jason.encode!()

@@ -1,4 +1,4 @@
-defmodule Mailstore.Repo.Migrations.CreateMail do
+defmodule Mailstore.Shard.Migrations.CreateMail do
   @moduledoc """
   Mail shard: folders, message metadata, bodies, expunge log.
 

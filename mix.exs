@@ -40,9 +40,10 @@ defmodule Mailstore.MixProject do
   defp aliases do
     [
       setup: ["deps.get", "ecto.setup"],
-      "ecto.setup": ["ecto.create", "ecto.migrate"],
-      "ecto.reset": ["ecto.drop", "ecto.setup"],
-      test: ["ecto.create --quiet", "ecto.migrate --quiet", "test"]
+      # The directory, then the bootstrap shard and every shard (priv/shard/migrations).
+      "ecto.setup": ["ecto.create", "mailstore.migrate"],
+      "ecto.reset": ["mailstore.drop", "ecto.setup"],
+      test: ["ecto.create --quiet", "mailstore.migrate --quiet", "test"]
     ]
   end
 end

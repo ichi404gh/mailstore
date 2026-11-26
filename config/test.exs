@@ -5,6 +5,20 @@ config :mailstore, Mailstore.Repo,
     System.get_env("TEST_DATABASE_URL", "ecto://postgres:postgres@localhost:55432/mailstore_test"),
   pool_size: 20
 
+# Directory: mailstore_test; mail: mailstore_test_shard1 (created by `mix test`).
+config :mailstore, :bootstrap_shards, [
+  %{
+    name: "shard1",
+    url:
+      System.get_env(
+        "TEST_SHARD1_URL",
+        "ecto://postgres:postgres@localhost:55432/mailstore_test_shard1"
+      ),
+    create: true,
+    pool_size: 20
+  }
+]
+
 config :logger, level: :warning
 
 # Random free port; tests read it with Mailstore.Imap.port/0.

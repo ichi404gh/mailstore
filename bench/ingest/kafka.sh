@@ -8,7 +8,7 @@ set -euo pipefail
 IMAGE=apache/kafka@sha256:0bc1bb2478f45b6cea78864df86acdc11e8df2c5172477819a4d12942cbe5d40 # 4.1.1
 NAME=mailstore-kafka
 PARTITIONS=${2:-16}
-TOPICS=(mailhub_relay_sender_in.basic mailhub_relay_sender_in.priority mailstore_ingest_dead_letter)
+TOPICS=(mailstore.inbound mailstore.inbound.priority mailstore.inbound.dead_letter)
 kt() { docker exec "$NAME" /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 "$@"; }
 
 topics() {

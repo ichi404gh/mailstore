@@ -14,6 +14,7 @@ defmodule Mailstore.Mailbox.Schemas.Folder do
     field :messages_count, :integer, default: 0
     field :unseen_count, :integer, default: 0
     field :subscribed, :boolean, default: true
+    field :fenced, :boolean, default: false
     timestamps()
   end
 end

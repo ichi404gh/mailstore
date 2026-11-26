@@ -16,8 +16,11 @@ defmodule Mailstore.Mailbox.PartitionsTest do
     this_week =
       DateTime.new!(Date.beginning_of_week(Date.utc_today()), ~T[00:00:00.000000], "Etc/UTC")
 
-    assert {:ok, %{dropped: [_], affected_folders: [fid]}} =
+    # One messages_<week> per shard.
+    assert {:ok, %{dropped: [_ | _] = dropped, affected_folders: [fid]}} =
              Mailbox.drop_partitions_before(this_week)
+
+    assert Enum.all?(dropped, &String.starts_with?(&1, "messages_"))
 
     assert Mailbox.uids(a.tenant_id, fid) == [4, 5]
 

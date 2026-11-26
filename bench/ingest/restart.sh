@@ -8,7 +8,7 @@ COUNT=${1:-50000}
 SEED=${2:-$RANDOM}
 GROUP=bench-restart-$SEED
 PG=${PG_CONTAINER:-mailstore-pg}
-DB=${DB:-mailstore_dev}
+DB=${DB:-mailstore_dev_shard1}  # the shard the bench tenant lives on
 sql() { docker exec "$PG" psql -U postgres -d "$DB" -Atc "$1"; }
 run_env=(MAILSTORE_KAFKA_HOSTS=localhost:9092 MAILSTORE_KAFKA_GROUP=$GROUP
   MAILSTORE_KAFKA_OFFSET_RESET=earliest MAILSTORE_IMAP_PORT=0)

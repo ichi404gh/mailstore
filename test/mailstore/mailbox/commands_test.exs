@@ -12,8 +12,10 @@ defmodule Mailstore.Mailbox.CommandsTest do
     1..40
     |> Task.async_stream(
       fn _ ->
-        Repo.transaction(fn ->
-          Commands.append(Repo, fid, a.tenant_id, [new_message(), new_message()])
+        repo = shard_repo(a)
+
+        repo.transaction(fn ->
+          Commands.append(repo, fid, a.tenant_id, [new_message(), new_message()])
         end)
       end,
       max_concurrency: 10

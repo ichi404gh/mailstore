@@ -80,7 +80,7 @@ defmodule Mailstore.Ingest.PipelineTest do
     assert DateTime.compare(row.internal_date, ~U[2026-11-26 10:02:51Z]) == :eq
 
     assert [[1]] ==
-             Repo.query!("SELECT class FROM messages WHERE folder_id = $1", [
+             shard_repo(bob).query!("SELECT class FROM messages WHERE folder_id = $1", [
                folder_id(bob, "INBOX")
              ]).rows
   end
