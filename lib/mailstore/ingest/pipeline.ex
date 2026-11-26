@@ -2,9 +2,9 @@ defmodule Mailstore.Ingest.Pipeline do
   @moduledoc """
   Consumer of the inbound topics: Kafka -> `Ingest.Record` -> `Delivery.deliver_many/1`.
 
-  * Processors parse records and do the CPU work in parallel: MIME structure, envelope,
-    zstd. A record that cannot be parsed fails and goes to the dead-letter topic
-    (`handle_failed/2`).
+  * Processors parse records and do the CPU work in parallel (`Delivery.plan/1`):
+    recipient lookup, delivery rules, MIME structure, envelope, zstd. A record that
+    cannot be parsed fails and goes to the dead-letter topic (`handle_failed/2`).
   * A batch (`batch_size` records or `batch_timeout` ms) is one group commit per shard
     (`Mailstore.Mailbox.deliver/1`).
   * Offsets are committed after the batch, periodically (BroadwayKafka). Writing is
@@ -22,7 +22,6 @@ defmodule Mailstore.Ingest.Pipeline do
   require Logger
 
   alias Broadway.Message
-  alias Mailstore.Core.NewMessage
   alias Mailstore.Delivery
   alias Mailstore.Ingest.{DeadLetter, Record}
 
@@ -92,19 +91,21 @@ defmodule Mailstore.Ingest.Pipeline do
     case Record.parse(message.data) do
       # The original stays referenced for the dead-letter topic (no copy: same binary).
       {:ok, r} ->
-        msg =
-          r.raw
-          |> NewMessage.from_raw(class: r.class, internal_date: r.received_at)
-          |> NewMessage.compress()
-
-        entry = %{rcpt: r.rcpt, msg: msg, class: r.class, key: r.key}
+        plan =
+          Delivery.plan(%{
+            rcpt: r.rcpt,
+            raw: r.raw,
+            class: r.class,
+            internal_date: r.received_at,
+            key: r.key
+          })
 
         # BroadwayKafka batches per topic partition, to keep its order. Records are
         # independent (UIDs come from the database), so batch across partitions: at
         # 1 000 records/s over 16 partitions that is ~15x bigger batches. Acks stay
         # correct: offsets acked out of order are committed once contiguous.
         %{message | metadata: Map.put(message.metadata, :raw_value, message.data)}
-        |> Message.put_data(entry)
+        |> Message.put_data(plan)
         |> Message.put_batch_key(:ingest)
 
       {:error, reason} ->
@@ -162,7 +163,7 @@ defmodule Mailstore.Ingest.Pipeline do
 
   # Group commit; waits out database outages (nothing is acked meanwhile).
   defp deliver(messages, backoff \\ 100) do
-    messages |> Enum.map(& &1.data) |> Delivery.deliver_many()
+    messages |> Enum.map(& &1.data) |> Delivery.store()
   rescue
     e ->
       if transient?(e) do
@@ -198,7 +199,9 @@ defmodule Mailstore.Ingest.Pipeline do
   defp transient?(_), do: false
 
   defp count(results) do
-    Enum.reduce(results, %{messages: 0, stored: 0, duplicate: 0, unknown: 0, failed: 0}, fn
+    zero = %{messages: 0, stored: 0, duplicate: 0, discarded: 0, unknown: 0, failed: 0}
+
+    Enum.reduce(results, zero, fn
       result, acc ->
         acc = Map.update!(acc, :messages, &(&1 + 1))
 
@@ -207,6 +210,7 @@ defmodule Mailstore.Ingest.Pipeline do
             Enum.reduce(targets, acc, fn
               {:stored, _, _, _}, a -> Map.update!(a, :stored, &(&1 + 1))
               {:duplicate, _}, a -> Map.update!(a, :duplicate, &(&1 + 1))
+              {:discarded, _}, a -> Map.update!(a, :discarded, &(&1 + 1))
               {:failed, _, _}, a -> Map.update!(a, :failed, &(&1 + 1))
               {:external, _}, a -> a
             end)

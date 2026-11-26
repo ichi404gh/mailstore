@@ -1,0 +1,141 @@
+{
+  "source": "example: the format of delivery rules (see Mailstore.Core.Rules); the production set is kept outside the repository",
+  "rules": [
+    {
+      "name": "BounceToMailbox",
+      "stage": "detect",
+      "position": 10,
+      "description": "Bounces with this SMTP code go to the bounce mailbox; the recipient keeps no copy.",
+      "test": {
+        "body": {
+          "contains_any": [
+            "550 5.1.1 example-bounce"
+          ]
+        }
+      },
+      "actions": [
+        {
+          "redirect": "bounces@example.test"
+        },
+        "stop"
+      ]
+    },
+    {
+      "name": "VendorA",
+      "stage": "detect",
+      "position": 20,
+      "description": "Warmup vendor A: marker in Message-ID or References. Tagged, classed warmup, never forwarded.",
+      "test": {
+        "any": [
+          {
+            "header": "Message-ID",
+            "contains": "<vendor-a-",
+            "case": "sensitive"
+          },
+          {
+            "header": "References",
+            "contains": "<vendor-a-",
+            "case": "sensitive"
+          }
+        ]
+      },
+      "actions": [
+        {
+          "add_header": [
+            "X-Warmup-Vendor",
+            "VendorA"
+          ]
+        },
+        {
+          "set_class": "warmup"
+        },
+        "stop"
+      ]
+    },
+    {
+      "name": "VendorB",
+      "stage": "detect",
+      "position": 30,
+      "description": "Warmup vendor B: the subject token after the last pipe appears as a body line (capture example).",
+      "test": {
+        "all": [
+          {
+            "header": "Subject",
+            "regex": "\\| ([A-Z0-9]{6})$",
+            "capture": true,
+            "case": "sensitive"
+          },
+          {
+            "body": {
+              "regex": "\n${1}(\r?\n|$)",
+              "case": "sensitive"
+            }
+          }
+        ]
+      },
+      "actions": [
+        {
+          "add_header": [
+            "X-Warmup-Vendor",
+            "VendorB"
+          ]
+        },
+        {
+          "set_class": "warmup"
+        },
+        "stop"
+      ]
+    },
+    {
+      "name": "DropMarker",
+      "stage": "detect",
+      "position": 40,
+      "description": "Our own test traffic: discarded.",
+      "test": {
+        "body": {
+          "contains": "example-drop-marker",
+          "case": "sensitive"
+        }
+      },
+      "actions": [
+        "discard",
+        "stop"
+      ]
+    },
+    {
+      "name": "AutoReply",
+      "stage": "forward",
+      "position": 1000,
+      "description": "Out-of-office replies stay in the inbox, not forwarded.",
+      "test": {
+        "header": "Subject",
+        "contains_any": [
+          "Automatic reply:"
+        ]
+      },
+      "actions": [
+        "stop"
+      ]
+    },
+    {
+      "name": "Forward",
+      "stage": "forward",
+      "position": 9000,
+      "description": "Everything else is forwarded; the copies say whose mailbox they came from.",
+      "test": true,
+      "actions": [
+        {
+          "forward": {
+            "headers": [
+              [
+                "X-Forwarded-From",
+                "${to_address}"
+              ]
+            ]
+          }
+        },
+        "stop"
+      ]
+    }
+  ]
+}

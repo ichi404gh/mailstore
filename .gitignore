@@ -35,3 +35,7 @@ deps/
 
 # Compatibility runs: downloaded test suites.
 /compat/.cache/
+
+# Local-only files, never committed: any directory named local/ (e.g.
+# priv/delivery_rules/local/ for real rule sets, test/local/ for tests built on them).
+local/

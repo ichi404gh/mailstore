@@ -20,7 +20,7 @@ defmodule Mailstore.DataCase do
     end
 
     Mailstore.Repo.query!(
-      "TRUNCATE tenants, domains, accounts, forwardings, folders, messages, message_bodies, vanished, deliveries RESTART IDENTITY CASCADE"
+      "TRUNCATE tenants, domains, accounts, forwardings, folders, messages, message_bodies, vanished, deliveries, delivery_rules RESTART IDENTITY CASCADE"
     )
 
     Mailstore.Directory.Cache.reset()

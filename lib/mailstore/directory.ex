@@ -12,7 +12,8 @@ defmodule Mailstore.Directory do
   """
   alias Mailstore.{Mailbox, Repo}
   alias Mailstore.Directory.{Cache, Password, Queries}
-  alias Mailstore.Directory.Schemas.{Account, Domain, Forwarding, Tenant}
+  alias Mailstore.Core.Rules
+  alias Mailstore.Directory.Schemas.{Account, DeliveryRule, Domain, Forwarding, Tenant}
 
   ## Tenants and domains
 
@@ -132,5 +133,94 @@ defmodule Mailstore.Directory do
         else: account_id |> Queries.enabled_forwardings_of() |> Repo.all()
 
     if class, do: Enum.filter(rules, &Forwarding.applies?(&1, class)), else: rules
+  end
+
+  ## Delivery rules (what the Sieve scripts did, as data: Mailstore.Core.Rules)
+
+  @doc "Compiled rules that apply to a mailbox: global, its tenant's and its own."
+  def rules_for(%{id: account_id, tenant_id: tenant_id}) do
+    if Cache.loaded?() do
+      Cache.rules(tenant_id, account_id)
+    else
+      import Ecto.Query
+
+      from(r in DeliveryRule,
+        where:
+          r.enabled and
+            (r.scope == "global" or (r.scope == "tenant" and r.tenant_id == ^tenant_id) or
+               (r.scope == "account" and r.account_id == ^account_id))
+      )
+      |> Repo.all()
+      |> Enum.flat_map(fn r ->
+        case Rules.compile(DeliveryRule.to_map(r)) do
+          {:ok, rule} -> [rule]
+          {:error, _} -> []
+        end
+      end)
+    end
+  end
+
+  @doc """
+  Add a rule. `attrs`: `scope` ("global" | "tenant" | "account"), `tenant_id` or
+  `account_id`, `stage`, `position`, `name`, `spec` (`%{"test" => ..., "actions" => [...]}`).
+  An invalid spec is rejected with the compiler's reason.
+  """
+  def create_rule(attrs) do
+    with {:ok, rule} <- %DeliveryRule{} |> DeliveryRule.changeset(Map.new(attrs)) |> Repo.insert() do
+      :ok = Cache.put_rule(rule)
+      {:ok, rule}
+    end
+  end
+
+  def update_rule(%DeliveryRule{} = rule, attrs) do
+    with {:ok, rule} <- rule |> DeliveryRule.changeset(Map.new(attrs)) |> Repo.update() do
+      :ok = Cache.put_rule(rule)
+      {:ok, rule}
+    end
+  end
+
+  def delete_rule(%DeliveryRule{} = rule) do
+    with {:ok, rule} <- Repo.delete(rule) do
+      :ok = Cache.delete_rule(rule)
+      {:ok, rule}
+    end
+  end
+
+  @doc """
+  Replace all global rules with `rules` (maps with `name`, `stage`, `position`, `test`,
+  `actions`, as in `priv/delivery_rules/*.json`) in one transaction. Either every rule
+  is valid and the set is swapped, or nothing changes: `{:error, name, reason}`.
+  """
+  def import_global_rules(rules) when is_list(rules) do
+    result =
+      Repo.transaction(fn ->
+        import Ecto.Query
+        Repo.delete_all(from(r in DeliveryRule, where: r.scope == "global"))
+
+        for r <- rules do
+          attrs = %{
+            scope: "global",
+            stage: r["stage"],
+            position: r["position"],
+            name: r["name"],
+            spec: Map.take(r, ["test", "actions"]),
+            enabled: Map.get(r, "enabled", true)
+          }
+
+          case %DeliveryRule{} |> DeliveryRule.changeset(attrs) |> Repo.insert() do
+            {:ok, rule} -> rule
+            {:error, cs} -> Repo.rollback({r["name"], inspect(cs.errors)})
+          end
+        end
+      end)
+
+    case result do
+      {:ok, inserted} ->
+        :ok = Cache.reload_rules()
+        {:ok, length(inserted)}
+
+      {:error, {name, reason}} ->
+        {:error, name, reason}
+    end
   end
 end

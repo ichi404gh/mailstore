@@ -471,4 +471,23 @@ defmodule Mailstore.Core.Mime do
       do: "",
       else: binary_part(raw, offset, min(len, byte_size(raw) - offset))
   end
+
+  @doc """
+  The tree of the same message with `delta` bytes of header lines put in front (what
+  delivery rules do when they add a header): offsets move, the root header grows.
+  """
+  def shift(tree, 0), do: tree
+
+  def shift(%{"h" => [0, hlen]} = root, delta),
+    do: shift_node(%{root | "h" => [-delta, hlen + delta]}, delta)
+
+  defp shift_node(node, delta) do
+    node
+    |> Map.update!("h", fn [o, l] -> [o + delta, l] end)
+    |> Map.update!("b", fn [o, l] -> [o + delta, l] end)
+    |> then(fn n ->
+      if n["c"], do: Map.update!(n, "c", &Enum.map(&1, fn c -> shift_node(c, delta) end)), else: n
+    end)
+    |> then(fn n -> if n["m"], do: Map.update!(n, "m", &shift_node(&1, delta)), else: n end)
+  end
 end

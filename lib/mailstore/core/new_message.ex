@@ -56,6 +56,26 @@ defmodule Mailstore.Core.NewMessage do
   end
 
   @doc """
+  The same message with header lines put in front (`prefix`, e.g. a tag added by a
+  delivery rule): no second parse, the MIME offsets are shifted. Envelope and indexes
+  do not change (rules add X- headers), the class may.
+  """
+  def prepend(%__MODULE__{} = msg, "", class), do: %{msg | class: MessageClass.to_int(class)}
+
+  def prepend(%__MODULE__{} = msg, prefix, class) do
+    raw = prefix <> msg.raw
+
+    %{
+      msg
+      | raw: raw,
+        size: byte_size(raw),
+        class: MessageClass.to_int(class),
+        bodystructure: Mime.shift(msg.bodystructure, byte_size(prefix)),
+        body: nil
+    }
+  end
+
+  @doc """
   Compress the body now, so the writer does not do it inside its transaction (ingest
   calls this in parallel processors, before the group commit).
   """

@@ -10,6 +10,9 @@ defmodule Mailstore.Directory.Cache do
     * forwardings: {source_account_id, forwarding_id} -> forwarding map (ordered_set,
       so all rules of one account are a prefix range)
     * auth:        {account_id, fingerprint} -> expires_at, successful LOGINs (see below)
+    * rules:       {scope, rule_id} -> compiled delivery rule (`Mailstore.Core.Rules`),
+      scope `:global`, `{:tenant, id}` or `{:account, id}`; the global rules are also
+      kept as one list in a persistent term, so delivery does not copy them per message
 
   Freshness: loaded at start (until then callers fall back to the database), then every
   `poll_ms` it reads rows whose `updated_at` moved, and every `full_reload_ms` it reloads
@@ -26,13 +29,16 @@ defmodule Mailstore.Directory.Cache do
   require Logger
 
   import Ecto.Query
-  alias Mailstore.Directory.Schemas.{Account, Forwarding}
+  alias Mailstore.Core.Rules
+  alias Mailstore.Directory.Schemas.{Account, DeliveryRule, Forwarding}
   alias Mailstore.Repo
 
   @accounts :mailstore_dir_accounts
   @addresses :mailstore_dir_addresses
   @forwardings :mailstore_dir_forwardings
   @auth :mailstore_dir_auth
+  @rules :mailstore_dir_rules
+  @global_rules {__MODULE__, :global_rules}
   @loaded {__MODULE__, :loaded}
   @secret {__MODULE__, :secret}
   @batch 5_000
@@ -62,6 +68,13 @@ defmodule Mailstore.Directory.Cache do
     :ets.select(@forwardings, [{{{account_id, :_}, :"$1"}, [], [:"$1"]}])
   end
 
+  @doc "Compiled delivery rules for a mailbox: global, its tenant's and its own (unsorted)."
+  def rules(tenant_id, account_id) do
+    :persistent_term.get(@global_rules, []) ++
+      :ets.select(@rules, [{{{{:tenant, tenant_id}, :_}, :"$1"}, [], [:"$1"]}]) ++
+      :ets.select(@rules, [{{{{:account, account_id}, :_}, :"$1"}, [], [:"$1"]}])
+  end
+
   def auth_ok?(account, password) do
     case :ets.lookup(@auth, {account.id, fingerprint(account, password)}) do
       [{_, expires}] -> expires > now()
@@ -83,6 +96,12 @@ defmodule Mailstore.Directory.Cache do
   def put_forwarding(%Forwarding{} = fwd),
     do: GenServer.call(__MODULE__, {:put_forwarding, compact(fwd)})
 
+  def put_rule(%DeliveryRule{} = rule), do: GenServer.call(__MODULE__, {:put_rule, compact(rule)})
+  def delete_rule(%DeliveryRule{} = rule), do: GenServer.call(__MODULE__, {:delete_rule, rule})
+
+  @doc "Reload all rules now (after a bulk import that deleted rows)."
+  def reload_rules, do: GenServer.call(__MODULE__, :reload_rules, 60_000)
+
   @doc "Pick up database changes now (instead of waiting for the next poll)."
   def refresh, do: GenServer.call(__MODULE__, :refresh, 60_000)
 
@@ -98,9 +117,11 @@ defmodule Mailstore.Directory.Cache do
     :ets.new(@addresses, [:set | opts])
     :ets.new(@forwardings, [:ordered_set | opts])
     :ets.new(@auth, [:set, {:write_concurrency, true} | opts])
+    :ets.new(@rules, [:ordered_set | opts])
+    :persistent_term.put(@global_rules, [])
     :persistent_term.put(@secret, :crypto.strong_rand_bytes(32))
     :persistent_term.put(@loaded, false)
-    {:ok, %{accounts_since: nil, forwardings_since: nil}, {:continue, :load}}
+    {:ok, %{accounts_since: nil, forwardings_since: nil, rules_since: nil}, {:continue, :load}}
   end
 
   @impl true
@@ -126,11 +147,26 @@ defmodule Mailstore.Directory.Cache do
     {:reply, :ok, st}
   end
 
+  def handle_call({:put_rule, rule}, _from, st) do
+    upsert_rule(rule)
+    publish_global()
+    {:reply, :ok, st}
+  end
+
+  def handle_call({:delete_rule, rule}, _from, st) do
+    :ets.delete(@rules, {DeliveryRule.scope_key(rule), rule.id})
+    publish_global()
+    {:reply, :ok, st}
+  end
+
+  def handle_call(:reload_rules, _from, st), do: {:reply, :ok, reload_rules(st)}
+
   def handle_call(:refresh, _from, st), do: {:reply, :ok, poll(st)}
 
   def handle_call(:reset, _from, st) do
-    Enum.each([@accounts, @addresses, @forwardings, @auth], &:ets.delete_all_objects/1)
-    {:reply, :ok, %{st | accounts_since: nil, forwardings_since: nil}}
+    Enum.each([@accounts, @addresses, @forwardings, @auth, @rules], &:ets.delete_all_objects/1)
+    :persistent_term.put(@global_rules, [])
+    {:reply, :ok, %{st | accounts_since: nil, forwardings_since: nil, rules_since: nil}}
   end
 
   @impl true
@@ -170,7 +206,15 @@ defmodule Mailstore.Directory.Cache do
     end)
 
     drop_missing(@forwardings, fwd_keys, fn _ -> :ok end)
+    st = reload_rules(st)
     %{st | accounts_since: accounts_since, forwardings_since: forwardings_since}
+  end
+
+  defp reload_rules(st) do
+    {rule_keys, rules_since} = load_all(DeliveryRule, &upsert_rule/1)
+    drop_missing(@rules, rule_keys, fn _ -> :ok end)
+    publish_global()
+    %{st | rules_since: rules_since}
   end
 
   defp load_all(schema, upsert) do
@@ -197,7 +241,16 @@ defmodule Mailstore.Directory.Cache do
     Enum.each(accounts, &upsert_account/1)
     {fwds, forwardings_since} = changed_since(Forwarding, st.forwardings_since)
     Enum.each(fwds, &upsert_forwarding/1)
-    %{st | accounts_since: accounts_since, forwardings_since: forwardings_since}
+    {rules, rules_since} = changed_since(DeliveryRule, st.rules_since)
+    Enum.each(rules, &upsert_rule/1)
+    if Enum.any?(rules, &match?({:global, _}, &1.key)), do: publish_global()
+
+    %{
+      st
+      | accounts_since: accounts_since,
+        forwardings_since: forwardings_since,
+        rules_since: rules_since
+    }
   end
 
   # `>=` so rows sharing the boundary timestamp are not missed (re-applying is harmless).
@@ -222,6 +275,17 @@ defmodule Mailstore.Directory.Cache do
   defp upsert_forwarding(fwd),
     do: :ets.insert(@forwardings, {{fwd.source_account_id, fwd.id}, fwd})
 
+  # A disabled or invalid rule leaves the cache.
+  defp upsert_rule(%{key: key, rule: nil}), do: :ets.delete(@rules, key)
+  defp upsert_rule(%{key: key, rule: rule}), do: :ets.insert(@rules, {key, rule})
+
+  defp publish_global do
+    global = :ets.select(@rules, [{{{:global, :_}, :"$1"}, [], [:"$1"]}])
+
+    if global != :persistent_term.get(@global_rules, []),
+      do: :persistent_term.put(@global_rules, global)
+  end
+
   defp drop_missing(table, keep, on_drop) do
     :ets.foldl(
       fn {key, _}, :ok ->
@@ -238,6 +302,7 @@ defmodule Mailstore.Directory.Cache do
     :ets.delete(table, key)
   end
 
+  defp key(%{key: key}), do: key
   defp key(%{source_account_id: source, id: id}), do: {source, id}
   defp key(%{id: id}), do: id
 
@@ -258,6 +323,22 @@ defmodule Mailstore.Directory.Cache do
         :only_classes,
         :enabled
       ])
+
+  defp compact(%DeliveryRule{} = r) do
+    rule =
+      if r.enabled do
+        case Rules.compile(DeliveryRule.to_map(r)) do
+          {:ok, rule} ->
+            rule
+
+          {:error, reason} ->
+            Logger.warning("delivery rule #{r.id} (#{r.name}) skipped: #{reason}")
+            nil
+        end
+      end
+
+    %{key: {DeliveryRule.scope_key(r), r.id}, rule: rule}
+  end
 
   defp safely(st, fun) do
     fun.(st)
