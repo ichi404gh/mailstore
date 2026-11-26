@@ -25,5 +25,19 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
+  # S3-compatible store for the cold tier (Mailstore.ColdStore.S3), on :8333. MinIO's
+  # images are no longer published; any S3 API works the same. Create the bucket once:
+  #   curl -X PUT localhost:8333/mailstore-cold
+  # and run with MAILSTORE_COLD_S3_ENDPOINT=http://localhost:8333.
+  s3:
+    image: chrislusf/seaweedfs:4.53@sha256:ccad23e18639c8b98cee17e7100b95830a06077b56d8e5b006d6dcf8ec5e94a0
+    container_name: mailstore-s3
+    command: ["server", "-s3", "-dir=/data"]
+    ports:
+      - "8333:8333"
+    volumes:
+      - s3data:/data
+
 volumes:
   pgdata:
+  s3data:

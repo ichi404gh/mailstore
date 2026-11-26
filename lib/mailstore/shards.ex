@@ -101,10 +101,7 @@ defmodule Mailstore.Shards do
 
     case pending_migrations(repo) do
       [] ->
-        repo.query!(
-          "SELECT setval('folders_id_seq', GREATEST((SELECT last_value FROM folders_id_seq), $1))",
-          [id <<< 40]
-        )
+        id_ranges(repo, id)
 
         Partitions.ensure(repo)
         refresh()
@@ -142,7 +139,24 @@ defmodule Mailstore.Shards do
   Bring every registered shard to the current shard schema (what
   `mix mailstore.migrate` runs at deploy). Returns `[{repo, versions_applied}]`.
   """
-  def migrate_all, do: for(repo <- all(), do: {repo, migrate(repo)})
+  def migrate_all do
+    for {id, repo} <- Registry.entries() do
+      applied = migrate(repo)
+      id_ranges(repo, id)
+      {repo, applied}
+    end
+  end
+
+  # Ids that travel with a moving tenant come from the shard's own range (`id <<< 40`):
+  # folders (so UIDs and MODSEQs move unchanged) and cold packs.
+  defp id_ranges(repo, id) do
+    for seq <- ~w(folders_id_seq cold_packs_id_seq) do
+      repo.query!(
+        "SELECT setval('#{seq}', GREATEST((SELECT last_value FROM #{seq}), $1))",
+        [id <<< 40]
+      )
+    end
+  end
 
   @doc "Migration versions not yet applied on a shard's database."
   def pending_migrations(repo) do
@@ -198,6 +212,8 @@ defmodule Mailstore.Shards.Registry do
   end
 
   def repos, do: :ets.select(@table, [{{:_, :"$1"}, [], [:"$1"]}])
+
+  def entries, do: :ets.tab2list(@table) |> Enum.sort()
 
   def reload, do: GenServer.call(__MODULE__, :reload, 60_000)
 

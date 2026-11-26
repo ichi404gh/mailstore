@@ -31,7 +31,7 @@ defmodule Mailstore.ShardsTest do
   setup %{shard: shard} do
     # The second shard is not truncated by DataCase; keep its folder id range.
     Shards.repo_for(shard).query!(
-      "TRUNCATE folders, messages, message_bodies, vanished, deliveries"
+      "TRUNCATE folders, messages, message_bodies, cold_bodies, cold_packs, vanished, deliveries"
     )
 
     Mailbox.ensure_partitions()
@@ -267,7 +267,8 @@ defmodule Mailstore.ShardsTest do
       end)
 
     assert_receive :held
-    assert {:ok, %{weeks: []}} = Mailbox.apply_retention()
+    # (Other shards' old weeks may go; shard 1 is left alone.)
+    {:ok, _} = Mailbox.apply_retention()
     assert {:ok, %{messages_count: 1}} = Mailbox.status(a.id, "INBOX")
     release(mover)
 
@@ -280,6 +281,51 @@ defmodule Mailstore.ShardsTest do
     assert Task.yield(move, 300) == nil
     release(expiry)
     assert {:ok, %{to: ^shard}} = Task.await(move, 30_000)
+  end
+
+  test "a tenant's cold mail moves with it; the old shard's expiry leaves its packs alone",
+       %{shard: shard} do
+    root = Application.get_env(:mailstore, :cold_store)[:root]
+    File.rm_rf!(root)
+    tenant = tenant_fixture("cold")
+    a = account_fixture("a@cold.test", tenant: tenant)
+    s1 = Shards.repo_for(1)
+    s2 = Shards.repo_for(shard)
+    Mailbox.Partitions.ensure(s1, Date.add(Date.utc_today(), -60), 12)
+    old = DateTime.add(DateTime.utc_now(), -40 * 86_400)
+
+    raws =
+      for i <- 1..3,
+          do: raw_message(subject: "cold #{i}", body: String.duplicate("x#{i} ", 9_000))
+
+    {:ok, uids} =
+      Mailbox.append(a.id, "INBOX", Enum.map(raws, &NewMessage.from_raw(&1, class: :reply)),
+        stored_at: old
+      )
+
+    {:ok, %{packs: packs}} = Mailbox.Cold.run()
+    assert packs > 0
+    {:ok, _} = Shards.move_tenant(tenant.id, shard)
+
+    # The target has the locations and the packs; the source keeps no pack rows.
+    assert hd(
+             hd(
+               s2.query!("SELECT count(*) FROM cold_packs WHERE tenant_id = $1", [tenant.id]).rows
+             )
+           ) == packs
+
+    assert s1.query!("SELECT count(*) FROM cold_packs WHERE tenant_id = $1", [tenant.id]).rows ==
+             [[0]]
+
+    fid = folder_id(a, "INBOX")
+    assert Mailbox.fetch_raw_many(tenant.id, fid, uids) == Map.new(Enum.zip(uids, raws))
+
+    # Expiry on the old shard does not delete what the tenant now reads on the new one.
+    cutoff = Date.add(Date.utc_today(), -20)
+    Mailbox.Partitions.expire(s1, 0, cutoff)
+    assert length(Path.wildcard(Path.join(root, "**/*.pack"))) == packs
+    Mailbox.Partitions.expire(s2, 0, cutoff)
+    assert Path.wildcard(Path.join(root, "**/*.pack")) == []
   end
 
   test "IMAP APPEND racing the switch is retried on the new shard", %{shard: shard} do

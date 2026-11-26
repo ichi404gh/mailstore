@@ -67,6 +67,7 @@ defmodule Mailstore.Shards.Move do
     prepare_partitions(source, target, accounts)
     copied = bulk_copy(source, target, Map.keys(snapshot))
     copy_deliveries(source, target, accounts)
+    copy_cold(source, target, tenant_id, Map.keys(snapshot))
 
     frozen_at = System.monotonic_time(:millisecond)
     delta = freeze(source, target, tenant_id, accounts, snapshot)
@@ -125,7 +126,7 @@ defmodule Mailstore.Shards.Move do
               from(f in Folder, where: f.account_id in ^accounts and f.fenced, select: f.id)
             )
 
-          for table <- ~w(message_bodies messages vanished),
+          for table <- ~w(message_bodies cold_bodies messages vanished),
               do: repo.query!("DELETE FROM #{table} WHERE folder_id = ANY($1)", [ids])
 
           repo.query!("DELETE FROM deliveries WHERE account_id = ANY($1)", [accounts])
@@ -221,6 +222,56 @@ defmodule Mailstore.Shards.Move do
     end
   end
 
+  # The tenant's cold tier: its packs (ids from the source's range, unique across
+  # shards) and the locations of its bodies. No cold run writes during a move (the
+  # maintenance lock); expunges meanwhile are applied with the delta.
+  defp copy_cold(source, target, tenant_id, folder_ids) do
+    %{rows: packs} =
+      source.query!(
+        "SELECT id, tenant_id, retention, week, key, bytes, state, inserted_at FROM cold_packs WHERE tenant_id = $1",
+        [tenant_id]
+      )
+
+    for chunk <- Enum.chunk_every(packs, 5_000) do
+      target.query!(
+        """
+        INSERT INTO cold_packs (id, tenant_id, retention, week, key, bytes, state, inserted_at)
+        SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::smallint[], $4::date[], $5::text[],
+                             $6::bigint[], $7::text[], $8::timestamptz[])
+        ON CONFLICT (id) DO NOTHING
+        """,
+        columns(chunk)
+      )
+    end
+
+    for fid <- folder_ids do
+      %{rows: rows} =
+        source.query!(
+          """
+          SELECT folder_id, uid, stored_at, retention, pack_id, "offset", length, codec
+          FROM cold_bodies WHERE folder_id = $1
+          """,
+          [fid]
+        )
+
+      for chunk <- Enum.chunk_every(rows, 5_000) do
+        target.query!(
+          """
+          INSERT INTO cold_bodies (folder_id, uid, stored_at, retention, pack_id, "offset", length, codec)
+          SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::timestamptz[], $4::smallint[],
+                               $5::bigint[], $6::bigint[], $7::int[], $8::smallint[])
+          ON CONFLICT DO NOTHING
+          """,
+          columns(chunk)
+        )
+      end
+    end
+
+    :ok
+  end
+
+  defp columns(rows), do: rows |> Enum.zip() |> Enum.map(&Tuple.to_list/1)
+
   defp copy_deliveries(source, target, accounts) do
     %{rows: rows} =
       source.query!(
@@ -265,6 +316,8 @@ defmodule Mailstore.Shards.Move do
             target.transaction(fn -> apply_delta(source, target, accounts, folders, snapshot) end)
 
           source.query!("UPDATE folders SET fenced = true WHERE account_id = ANY($1)", [accounts])
+          # The packs belong to the target now: expiry on the source must not delete them.
+          source.query!("DELETE FROM cold_packs WHERE tenant_id = $1", [tenant_id])
           delta
         end,
         timeout: :infinity
@@ -303,7 +356,7 @@ defmodule Mailstore.Shards.Move do
         gone_uids = Enum.map(gone, & &1.uid)
 
         if gone_uids != [] do
-          for table <- ~w(message_bodies messages) do
+          for table <- ~w(message_bodies cold_bodies messages) do
             target.query!("DELETE FROM #{table} WHERE folder_id = $1 AND uid = ANY($2)", [
               f.id,
               gone_uids

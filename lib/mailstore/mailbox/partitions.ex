@@ -16,7 +16,9 @@ defmodule Mailstore.Mailbox.Partitions do
      Right after each chunk the actors of its accounts reload, wherever they run, and
      their selected sessions get EXPUNGE: a client sees the old state only between the
      detach and its folder's chunk.
-  4. The bodies of the week are detached and dropped the same way, without totals.
+  4. The bodies of the week are detached and dropped the same way, without totals,
+     and so are its cold-tier locations (`cold_bodies`); then its packs are deleted
+     from the object store (`Mailbox.Cold`).
 
   Expiry and tenant moves exclude each other per shard (`with_maintenance_lock/2`): a
   move copies folder rows and messages, and an expiry between those copies would
@@ -34,7 +36,7 @@ defmodule Mailstore.Mailbox.Partitions do
   # Shard maintenance: expiry holds it shared, a tenant move exclusive.
   @maintenance_lock 7003
   @lock_timeout "10s"
-  @week ~r/^(messages|message_bodies)_p(\d+)_(\d{4})w(\d{2})$/
+  @week ~r/^(messages|message_bodies|cold_bodies)_p(\d+)_(\d{4})w(\d{2})$/
 
   @doc """
   Make sure partitions exist: for every retention policy, weekly message partitions
@@ -185,10 +187,14 @@ defmodule Mailstore.Mailbox.Partitions do
           n + apply_pending(repo, pending)
         end)
 
-      for {name, attached} <- expired(repo, id, cutoff, "message_bodies") do
-        if attached, do: detach(repo, "message_bodies_p#{id}", name)
+      for table <- ~w(message_bodies cold_bodies),
+          {name, attached} <- expired(repo, id, cutoff, table) do
+        if attached, do: detach(repo, "#{table}_p#{id}", name)
         repo.query!("DROP TABLE #{name}")
       end
+
+      # The week's locations are gone: nothing refers to its packs any more.
+      Mailstore.Mailbox.Cold.delete_expired_packs(repo, id, cutoff)
 
       %{weeks: Enum.map(weeks, &elem(&1, 0)), folder_updates: folders}
     after
@@ -261,7 +267,8 @@ defmodule Mailstore.Mailbox.Partitions do
   defp columns(rows, _k), do: rows |> Enum.zip() |> Enum.map(&Tuple.to_list/1)
 
   # Detach without blocking traffic; finish a detach a crashed run left pending.
-  defp detach(repo, parent, name) do
+  @doc false
+  def detach(repo, parent, name) do
     %{rows: [[pending]]} =
       repo.query!(
         "SELECT inhdetachpending FROM pg_inherits WHERE inhrelid = to_regclass($1)",
@@ -271,6 +278,15 @@ defmodule Mailstore.Mailbox.Partitions do
     if pending,
       do: repo.query!("ALTER TABLE #{parent} DETACH PARTITION #{name} FINALIZE"),
       else: repo.query!("ALTER TABLE #{parent} DETACH PARTITION #{name} CONCURRENTLY")
+  end
+
+  @doc "Key of the shard maintenance advisory lock (see `with_maintenance_lock/2`)."
+  def maintenance_lock, do: @maintenance_lock
+
+  @doc "The day after the last day of a week partition (`messages_p0_2026w48` etc.)."
+  def week_end(name) do
+    [_, _table, _pid, year, week] = Regex.run(@week, name)
+    week_start(String.to_integer(year), String.to_integer(week)) |> Date.add(7)
   end
 
   # Monday of ISO week `week` of ISO year `year`.

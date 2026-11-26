@@ -18,7 +18,7 @@ defmodule Mailstore.Mailbox do
   (read queries), `Schemas.*`, `Partitions` (retention).
   """
   alias Mailstore.Core.{BodyCodec, Flags, NewMessage}
-  alias Mailstore.Mailbox.{AccountServer, Commands, Partitions, Queries, Retention}
+  alias Mailstore.Mailbox.{AccountServer, Cold, Commands, Partitions, Queries, Retention}
   alias Mailstore.Mailbox.Schemas.Folder
   alias Mailstore.Shards
 
@@ -226,21 +226,28 @@ defmodule Mailstore.Mailbox do
     |> Enum.map(fn m -> Map.put(m, :flags, Flags.to_list(m.flags, m.keywords)) end)
   end
 
-  @doc "BODY[]: the original bytes."
+  @doc "BODY[]: the original bytes, from Postgres or the cold tier."
   def fetch_raw(tenant_id, folder_id, uid) do
-    case run(tenant_id, :one, Queries.body(folder_id, uid)) do
-      {codec, data} -> {:ok, BodyCodec.decode(codec, data)}
-      nil -> :error
+    case fetch_raw_many(tenant_id, folder_id, [uid]) do
+      %{^uid => raw} -> {:ok, raw}
+      _ -> :error
     end
   end
 
-  @doc "BODY[] for several messages in one query: %{uid => bytes}."
+  @doc """
+  BODY[] for several messages: %{uid => bytes}. One query for the bodies in Postgres;
+  the rest are looked up in the cold tier (`Mailbox.Cold`).
+  """
   def fetch_raw_many(_tenant_id, _folder_id, []), do: %{}
 
   def fetch_raw_many(tenant_id, folder_id, uids) do
-    tenant_id
-    |> run(:all, Queries.bodies(folder_id, uids))
-    |> Map.new(fn {uid, codec, data} -> {uid, BodyCodec.decode(codec, data)} end)
+    repo = Shards.repo(tenant_id)
+    hot = Map.new(repo.all(Queries.bodies(folder_id, uids)), fn {uid, c, d} -> {uid, {c, d}} end)
+    cold = Cold.read(repo, folder_id, Enum.reject(uids, &Map.has_key?(hot, &1)))
+
+    hot
+    |> Map.merge(cold)
+    |> Map.new(fn {uid, {codec, data}} -> {uid, BodyCodec.decode(codec, data)} end)
   end
 
   @doc "CONDSTORE: flag changes and new messages since `modseq`."

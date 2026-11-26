@@ -28,3 +28,10 @@ config :mailstore, :pbkdf2_iterations, 1_000
 
 # Tests run retention themselves (Mailbox.apply_retention/1) with their own dates.
 config :mailstore, :retention, schedule: false
+
+# Cold tier in a local directory; tests run Mailbox.Cold.run/1 themselves. Small packs,
+# so a test week is split into several.
+config :mailstore, :cold_store,
+  adapter: Mailstore.ColdStore.Local,
+  root: Path.join(System.tmp_dir!(), "mailstore-cold-test"),
+  pack_bytes: 64 * 1024

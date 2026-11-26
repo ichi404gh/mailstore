@@ -1,9 +1,11 @@
 defmodule Mailstore.Mailbox.PartitionMaintainer do
   @moduledoc """
   Keeps future partitions created, drops `deliveries` days older than the dedup
-  horizon (`:delivery_dedup_days`) and applies retention (`Mailbox.apply_retention/1`)
-  unless `config :mailstore, :retention, schedule: false`. Every node runs it; per
-  shard and policy only one expiry runs at a time (an advisory lock).
+  horizon (`:delivery_dedup_days`), applies retention (`Mailbox.apply_retention/1`)
+  and moves due weeks to the cold tier (`Mailbox.Cold.run/1`, when a cold store is
+  configured), unless `config :mailstore, :retention, schedule: false`. Every node
+  runs it; per shard and policy only one expiry and one cold run at a time (advisory
+  locks). A cold run of a big week takes long; this process waits for it.
   """
   use GenServer
   require Logger
@@ -39,6 +41,13 @@ defmodule Mailstore.Mailbox.PartitionMaintainer do
           do: Logger.info("retention: dropped #{inspect(weeks)}, #{n} folder updates")
       rescue
         e -> Logger.warning("retention skipped: #{Exception.message(e)}")
+      end
+
+      try do
+        {:ok, cold} = Mailstore.Mailbox.Cold.run()
+        if cold.packs > 0, do: Logger.info("cold tier: #{inspect(cold)}")
+      rescue
+        e -> Logger.warning("cold tier run failed: #{Exception.message(e)}")
       end
     end
 

@@ -27,7 +27,10 @@ defmodule Mailstore.DataCase do
     )
 
     for repo <- Mailstore.Shards.all(),
-        do: repo.query!("TRUNCATE folders, messages, message_bodies, vanished, deliveries")
+        do:
+          repo.query!(
+            "TRUNCATE folders, messages, message_bodies, cold_bodies, cold_packs, vanished, deliveries"
+          )
 
     Mailstore.Directory.Cache.reset()
     Mailstore.Mailbox.ensure_partitions()

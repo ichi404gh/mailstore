@@ -396,6 +396,12 @@ defmodule Mailstore.Mailbox.Commands do
           WHERE b.folder_id = $1 AND b.uid = del.uid AND b.stored_at = del.stored_at
             AND b.retention = del.retention
           RETURNING 1
+        ), delc AS (
+          -- The bytes stay in their pack until the week expires.
+          DELETE FROM cold_bodies c USING del
+          WHERE c.folder_id = $1 AND c.uid = del.uid AND c.stored_at = del.stored_at
+            AND c.retention = del.retention
+          RETURNING 1
         ), van AS (
           INSERT INTO vanished (folder_id, uid, modseq)
           SELECT $1, uid, $2 FROM del
@@ -477,14 +483,51 @@ defmodule Mailstore.Mailbox.Commands do
         [src_folder_id, dst_folder_id, first_uid, first_modseq, stored_at, src_uids]
       )
 
-      repo.query!(
-        """
-        INSERT INTO message_bodies (folder_id, uid, stored_at, retention, codec, data)
-        SELECT $2, $3 + row_number() OVER (ORDER BY uid) - 1, $4, retention, codec, data
-        FROM message_bodies WHERE folder_id = $1 AND uid = ANY($5)
-        """,
-        [src_folder_id, dst_folder_id, first_uid, stored_at, src_uids]
-      )
+      dst_uids = Enum.to_list(first_uid..(first_uid + k - 1))
+
+      %{rows: hot} =
+        repo.query!(
+          """
+          INSERT INTO message_bodies (folder_id, uid, stored_at, retention, codec, data)
+          SELECT $2, m.dst, $3, b.retention, b.codec, b.data
+          FROM message_bodies b JOIN unnest($4::bigint[], $5::bigint[]) AS m(src, dst) ON m.src = b.uid
+          WHERE b.folder_id = $1
+          RETURNING uid
+          """,
+          [src_folder_id, dst_folder_id, stored_at, src_uids, dst_uids]
+        )
+
+      # Bodies in the cold tier come back to Postgres: the copy lives in the current
+      # week, after the packs of the source's week may be deleted.
+      copied = MapSet.new(List.flatten(hot))
+      dst_of = Map.new(Enum.zip(src_uids, dst_uids))
+
+      cold_src =
+        for {src, dst} <- Enum.zip(src_uids, dst_uids), not MapSet.member?(copied, dst), do: src
+
+      if cold_src != [] do
+        %{rows: policies} =
+          repo.query!(
+            "SELECT uid, retention FROM messages WHERE folder_id = $1 AND uid = ANY($2)",
+            [src_folder_id, cold_src]
+          )
+
+        policy = Map.new(policies, fn [uid, r] -> {uid, r} end)
+
+        rows =
+          for {src, {codec, data}} <- Mailstore.Mailbox.Cold.read(repo, src_folder_id, cold_src) do
+            %{
+              folder_id: dst_folder_id,
+              uid: dst_of[src],
+              stored_at: stored_at,
+              retention: policy[src],
+              codec: codec,
+              data: data
+            }
+          end
+
+        for chunk <- Enum.chunk_every(rows, 1_000), do: repo.insert_all(MessageBody, chunk)
+      end
 
       {Enum.zip(src_uids, first_uid..(first_uid + k - 1)//1), counters}
     end
@@ -532,7 +575,7 @@ defmodule Mailstore.Mailbox.Commands do
   def delete_folder(repo, folder_id) do
     lock_next_modseq(repo, folder_id)
 
-    for table <- ["message_bodies", "messages", "vanished"],
+    for table <- ["message_bodies", "cold_bodies", "messages", "vanished"],
         do: repo.query!("DELETE FROM #{table} WHERE folder_id = $1", [folder_id])
 
     repo.query!("DELETE FROM folders WHERE id = $1", [folder_id])

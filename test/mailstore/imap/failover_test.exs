@@ -31,7 +31,7 @@ defmodule Mailstore.Imap.FailoverTest do
 
   setup %{shard: shard} do
     Shards.repo_for(shard).query!(
-      "TRUNCATE folders, messages, message_bodies, vanished, deliveries"
+      "TRUNCATE folders, messages, message_bodies, cold_bodies, cold_packs, vanished, deliveries"
     )
 
     :ok

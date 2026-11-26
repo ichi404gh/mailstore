@@ -45,8 +45,21 @@ config :mailstore, :retention,
   ],
   classes: [warmup: :short],
   default: :standard,
-  # Run expiry from Mailbox.PartitionMaintainer (every 12 h on every node).
+  # Run expiry and the cold tier from Mailbox.PartitionMaintainer (every 12 h).
   schedule: true
+
+# Cold tier store (Mailstore.ColdStore). Not set: bodies stay in Postgres until they
+# expire. S3 API (MinIO, AWS S3, SeaweedFS...) or a local directory; pack_bytes splits
+# a tenant's week into objects of at most that size. Environment variables in
+# config/runtime.exs.
+#
+#   config :mailstore, :cold_store,
+#     adapter: Mailstore.ColdStore.S3,
+#     endpoint: "http://localhost:8333", bucket: "mailstore-cold", region: "us-east-1",
+#     access_key_id: "...", secret_access_key: "...", prefix: "cold",
+#     pack_bytes: 64 * 1024 * 1024
+#
+#   config :mailstore, :cold_store, adapter: Mailstore.ColdStore.Local, root: "/var/lib/mailstore/cold"
 
 # Inbound queue: Kafka topics filled by the SMTP layer (see Mailstore.Ingest). Off by
 # default; MAILSTORE_KAFKA_HOSTS turns it on (config/runtime.exs).

@@ -105,6 +105,27 @@ if json = System.get_env("MAILSTORE_RETENTION") do
     default: atom.(Map.get(r, "default", "standard"))
 end
 
+# Cold tier: an S3-compatible store (MAILSTORE_COLD_S3_ENDPOINT, e.g. http://minio:9000)
+# or a local directory (MAILSTORE_COLD_DIR).
+cond do
+  endpoint = System.get_env("MAILSTORE_COLD_S3_ENDPOINT") ->
+    config :mailstore, :cold_store,
+      adapter: Mailstore.ColdStore.S3,
+      endpoint: endpoint,
+      bucket: System.get_env("MAILSTORE_COLD_S3_BUCKET", "mailstore-cold"),
+      region: System.get_env("MAILSTORE_COLD_S3_REGION", "us-east-1"),
+      access_key_id: System.get_env("MAILSTORE_COLD_S3_ACCESS_KEY_ID"),
+      secret_access_key: System.get_env("MAILSTORE_COLD_S3_SECRET_ACCESS_KEY"),
+      prefix: System.get_env("MAILSTORE_COLD_S3_PREFIX", "cold"),
+      pack_bytes: String.to_integer(System.get_env("MAILSTORE_COLD_PACK_BYTES", "67108864"))
+
+  dir = System.get_env("MAILSTORE_COLD_DIR") ->
+    config :mailstore, :cold_store, adapter: Mailstore.ColdStore.Local, root: dir
+
+  true ->
+    :ok
+end
+
 # A single-shard production install: the shard's database (created and owned by the
 # platform, not by mailstore); further shards are added with Mailstore.Shards.register/3.
 if url = System.get_env("MAILSTORE_SHARD1_URL") do

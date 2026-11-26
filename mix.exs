@@ -33,7 +33,9 @@ defmodule Mailstore.MixProject do
       # Ingest from Kafka. Pinned to releases at least two weeks old.
       {:broadway, "== 1.3.1"},
       {:broadway_kafka, "== 0.7.1"},
-      {:brod, "== 4.7.0"}
+      {:brod, "== 4.7.0"},
+      # Cold tier: S3 API (MinIO, AWS S3), SigV4 signing built in.
+      {:req, "== 0.7.5"}
     ]
   end
 
