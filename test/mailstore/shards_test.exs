@@ -217,6 +217,71 @@ defmodule Mailstore.ShardsTest do
     assert length(messages_of(s2, a)) == 51 + during
   end
 
+  # Holds `sql` (an advisory lock) on `repo` in another process until told to let go.
+  defp hold(repo, sql) do
+    parent = self()
+
+    pid =
+      spawn_link(fn ->
+        repo.checkout(fn ->
+          repo.query!(sql)
+          send(parent, :held)
+          receive do: (:release -> repo.query!("SELECT pg_advisory_unlock_all()"))
+        end)
+
+        send(parent, :released)
+      end)
+
+    assert_receive :held
+    pid
+  end
+
+  defp release(pid) do
+    send(pid, :release)
+    assert_receive :released
+  end
+
+  test "expiry skips a shard a tenant move holds, and a move waits for a running expiry",
+       %{shard: shard} do
+    tenant = tenant_fixture("busy")
+    a = account_fixture("a@busy.test", tenant: tenant)
+    s1 = Shards.repo_for(1)
+    Mailbox.Partitions.ensure(s1, Date.add(Date.utc_today(), -50), 10)
+
+    {:ok, [_]} =
+      Mailbox.append(a.id, "INBOX", [new_message(class: :warmup)],
+        stored_at: DateTime.add(DateTime.utc_now(), -40 * 86_400)
+      )
+
+    # A move holds the shard: expiry leaves it alone.
+    parent = self()
+
+    mover =
+      spawn_link(fn ->
+        Mailbox.Partitions.with_maintenance_lock([{1, s1}], fn ->
+          send(parent, :held)
+          receive do: (:release -> :ok)
+        end)
+
+        send(parent, :released)
+      end)
+
+    assert_receive :held
+    assert {:ok, %{weeks: []}} = Mailbox.apply_retention()
+    assert {:ok, %{messages_count: 1}} = Mailbox.status(a.id, "INBOX")
+    release(mover)
+
+    assert {:ok, %{weeks: [_ | _]}} = Mailbox.apply_retention()
+    assert {:ok, %{messages_count: 0}} = Mailbox.status(a.id, "INBOX")
+
+    # An expiry is running (it holds the lock shared): the move waits for it.
+    expiry = hold(s1, "SELECT pg_advisory_lock_shared(7003, 0)")
+    move = Task.async(fn -> Shards.move_tenant(tenant.id, shard) end)
+    assert Task.yield(move, 300) == nil
+    release(expiry)
+    assert {:ok, %{to: ^shard}} = Task.await(move, 30_000)
+  end
+
   test "IMAP APPEND racing the switch is retried on the new shard", %{shard: shard} do
     tenant = tenant_fixture("appender")
     a = account_fixture("a@appender.test", tenant: tenant)

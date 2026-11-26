@@ -267,9 +267,10 @@ defmodule Mailstore.Mailbox do
 
   @doc """
   Retention (`Mailbox.Retention`): on every shard, drop each policy's weeks that ended
-  more than its `keep_days` before `today`, and fix the folder counters. Then every
-  account actor in the cluster reloads, and selected sessions see `EXPUNGE` for what
-  went. Returns `{:ok, %{weeks: [table], folder_updates: n}}`.
+  more than its `keep_days` before `today`, and fix the folder counters; the actors of
+  the affected accounts reload as their folders are done, and selected sessions see
+  `EXPUNGE` for what went (`Mailbox.Partitions`). Returns
+  `{:ok, %{weeks: [table], folder_updates: n}}`.
   """
   def apply_retention(today \\ Date.utc_today()) do
     results =
@@ -279,7 +280,6 @@ defmodule Mailstore.Mailbox do
 
     weeks = Enum.flat_map(results, & &1.weeks)
     folders = results |> Enum.map(& &1.folder_updates) |> Enum.sum()
-    if weeks != [] or folders > 0, do: AccountServer.reload_all()
     {:ok, %{weeks: weeks, folder_updates: folders}}
   end
 

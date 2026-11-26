@@ -185,6 +185,24 @@ defmodule Mailstore.Mailbox.AccountServer do
     reload_local()
   end
 
+  @doc """
+  Reload the actors of these accounts wherever they run, e.g. after retention changed
+  their folders: their sessions resync and see EXPUNGE for what went.
+  """
+  def reload(account_ids) do
+    for n <- Placement.members(),
+        n != node(),
+        do: :erpc.cast(n, __MODULE__, :reload_local, [account_ids])
+
+    reload_local(account_ids)
+  end
+
+  @doc false
+  def reload_local(account_ids) when is_list(account_ids) do
+    for id <- account_ids, pid = whereis(id), do: GenServer.cast(pid, :reload)
+    :ok
+  end
+
   @doc false
   def reload_local do
     for pid <- Registry.select(@registry, [{{:_, :"$1", :_}, [], [:"$1"]}]),

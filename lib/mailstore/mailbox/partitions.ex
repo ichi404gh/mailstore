@@ -13,7 +13,14 @@ defmodule Mailstore.Mailbox.Partitions do
   3. Folder counters are reduced in chunks of folders, each chunk in its own short
      transaction that also deletes its rows from the totals, in folder id order like
      every writer (no deadlocks, no folder locked for long). HIGHESTMODSEQ goes up.
+     Right after each chunk the actors of its accounts reload, wherever they run, and
+     their selected sessions get EXPUNGE: a client sees the old state only between the
+     detach and its folder's chunk.
   4. The bodies of the week are detached and dropped the same way, without totals.
+
+  Expiry and tenant moves exclude each other per shard (`with_maintenance_lock/2`): a
+  move copies folder rows and messages, and an expiry between those copies would
+  leave the counters on the new shard short.
 
   A crashed run leaves detached tables or totals behind; the next run finds them by
   name and goes on. UIDs removed this way are not logged in `vanished`: a session
@@ -24,6 +31,8 @@ defmodule Mailstore.Mailbox.Partitions do
   # Session advisory lock (key, policy id): one expiry per shard and policy at a time,
   # whichever node runs it.
   @expire_lock 7002
+  # Shard maintenance: expiry holds it shared, a tenant move exclusive.
+  @maintenance_lock 7003
   @lock_timeout "10s"
   @week ~r/^(messages|message_bodies)_p(\d+)_(\d{4})w(\d{2})$/
 
@@ -104,18 +113,50 @@ defmodule Mailstore.Mailbox.Partitions do
   """
   def expire(repo, id, %Date{} = cutoff) do
     repo.checkout(fn ->
-      case repo.query!("SELECT pg_try_advisory_lock(#{@expire_lock}, $1)", [id]) do
-        %{rows: [[true]]} ->
-          try do
-            locked_expire(repo, id, cutoff)
-          after
-            repo.query!("SELECT pg_advisory_unlock(#{@expire_lock}, $1)", [id])
-          end
+      %{rows: [[locked]]} =
+        repo.query!(
+          """
+          SELECT pg_try_advisory_lock(#{@expire_lock}, $1)
+             AND pg_try_advisory_lock_shared(#{@maintenance_lock}, 0)
+          """,
+          [id]
+        )
 
-        _ ->
-          %{weeks: [], folder_updates: 0, skipped: true}
+      try do
+        if locked,
+          do: locked_expire(repo, id, cutoff),
+          else: %{weeks: [], folder_updates: 0, skipped: true}
+      after
+        # Whatever was taken (the AND may have stopped after the first).
+        repo.query!("SELECT pg_advisory_unlock_all()")
       end
     end)
+  end
+
+  @doc """
+  Run `fun` holding the maintenance lock of every given shard (`[{shard_id, repo}]`)
+  exclusively, taken in shard id order (two moves cannot deadlock). Waits for running
+  expiries to finish; expiries started meanwhile skip these shards. Every query `fun`
+  makes through these repos runs on the connection that holds the lock.
+  """
+  def with_maintenance_lock(shards, fun) do
+    shards
+    |> Enum.uniq_by(&elem(&1, 0))
+    |> Enum.sort_by(&elem(&1, 0), :desc)
+    |> Enum.reduce(fun, fn {_id, repo}, inner ->
+      fn ->
+        repo.checkout(fn ->
+          repo.query!("SELECT pg_advisory_lock(#{@maintenance_lock}, 0)", [], timeout: :infinity)
+
+          try do
+            inner.()
+          after
+            repo.query!("SELECT pg_advisory_unlock(#{@maintenance_lock}, 0)")
+          end
+        end)
+      end
+    end)
+    |> then(& &1.())
   end
 
   defp locked_expire(repo, id, cutoff) do
@@ -171,7 +212,7 @@ defmodule Mailstore.Mailbox.Partitions do
   end
 
   defp apply_pending(repo, pending, total \\ 0) do
-    {:ok, n} =
+    {:ok, {n, accounts}} =
       repo.transaction(fn ->
         %{rows: rows} =
           repo.query!(
@@ -188,20 +229,25 @@ defmodule Mailstore.Mailbox.Partitions do
         # Lock in id order, like every writer of folders (Mailbox.Commands).
         repo.query!("SELECT id FROM folders WHERE id = ANY($1) ORDER BY id FOR UPDATE", [ids])
 
-        repo.query!(
-          """
-          UPDATE folders f
-          SET messages_count = GREATEST(f.messages_count - c.n, 0),
-              unseen_count = GREATEST(f.unseen_count - c.unseen, 0),
-              highest_modseq = f.highest_modseq + 1, updated_at = now()
-          FROM unnest($1::bigint[], $2::bigint[], $3::bigint[]) AS c(id, n, unseen)
-          WHERE f.id = c.id
-          """,
-          [ids, ns, unseen]
-        )
+        %{rows: accounts} =
+          repo.query!(
+            """
+            UPDATE folders f
+            SET messages_count = GREATEST(f.messages_count - c.n, 0),
+                unseen_count = GREATEST(f.unseen_count - c.unseen, 0),
+                highest_modseq = f.highest_modseq + 1, updated_at = now()
+            FROM unnest($1::bigint[], $2::bigint[], $3::bigint[]) AS c(id, n, unseen)
+            WHERE f.id = c.id
+            RETURNING f.account_id
+            """,
+            [ids, ns, unseen]
+          )
 
-        length(rows)
+        {length(rows), accounts |> List.flatten() |> Enum.uniq()}
       end)
+
+    # After the commit: the actors read the new counters.
+    if accounts != [], do: Mailstore.Mailbox.AccountServer.reload(accounts)
 
     if n < @chunk do
       repo.query!("DROP TABLE #{pending}")

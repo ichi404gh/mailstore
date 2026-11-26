@@ -52,32 +52,40 @@ defmodule Mailstore.Shards.Move do
       source = Shards.repo_for(source_id)
       target = Shards.repo_for(target_id)
       accounts = accounts_of(tenant_id)
-      started = System.monotonic_time(:millisecond)
 
-      snapshot = snapshot(source, accounts)
-      prepare_partitions(source, target, accounts)
-      copied = bulk_copy(source, target, Map.keys(snapshot))
-      copy_deliveries(source, target, accounts)
-
-      frozen_at = System.monotonic_time(:millisecond)
-      delta = freeze(source, target, tenant_id, accounts, snapshot)
-      frozen_ms = System.monotonic_time(:millisecond) - frozen_at
-
-      finish(tenant_id, target_id, accounts)
-
-      stats = %{
-        from: source_id,
-        to: target_id,
-        folders: map_size(snapshot),
-        messages: copied,
-        delta: delta,
-        frozen_ms: frozen_ms,
-        total_ms: System.monotonic_time(:millisecond) - started
-      }
-
-      Logger.info("tenant #{tenant_id} moved: #{inspect(stats)}")
-      {:ok, stats}
+      # No expiry on either shard while the tenant's rows are copied.
+      Mailstore.Mailbox.Partitions.with_maintenance_lock(
+        [{source_id, source}, {target_id, target}],
+        fn -> copy_and_switch(tenant_id, source_id, target_id, source, target, accounts) end
+      )
     end
+  end
+
+  defp copy_and_switch(tenant_id, source_id, target_id, source, target, accounts) do
+    started = System.monotonic_time(:millisecond)
+    snapshot = snapshot(source, accounts)
+    prepare_partitions(source, target, accounts)
+    copied = bulk_copy(source, target, Map.keys(snapshot))
+    copy_deliveries(source, target, accounts)
+
+    frozen_at = System.monotonic_time(:millisecond)
+    delta = freeze(source, target, tenant_id, accounts, snapshot)
+    frozen_ms = System.monotonic_time(:millisecond) - frozen_at
+
+    finish(tenant_id, target_id, accounts)
+
+    stats = %{
+      from: source_id,
+      to: target_id,
+      folders: map_size(snapshot),
+      messages: copied,
+      delta: delta,
+      frozen_ms: frozen_ms,
+      total_ms: System.monotonic_time(:millisecond) - started
+    }
+
+    Logger.info("tenant #{tenant_id} moved: #{inspect(stats)}")
+    {:ok, stats}
   end
 
   @doc "The switch: point the tenant at `target_id` and tell every node."
