@@ -13,7 +13,7 @@
 
 ## 1. Целевое развёртывание
 
-Вычисления и хранение разделены. BEAM-ноды не хранят состояния: любой ящик обслуживается на любой ноде, а ноды добавляются под нагрузку. Данные лежат в шардах Postgres, шард выбирается по tenant. TLS снимает HAProxy.
+Вычисления и хранение разделены. BEAM-ноды не хранят состояния: любой ящик обслуживается на любой ноде, а ноды добавляются под нагрузку. Данные лежат в шардах Postgres, шард выбирается по tenant; тела старых недель уходят в объектное хранилище. TLS снимает HAProxy.
 
 ```mermaid
 flowchart LR
@@ -39,7 +39,8 @@ flowchart LR
     s2[("шард N<br/>primary + реплика")]
   end
 
-  obj[("Объектное хранилище<br/>тела закрытых недель")]:::planned
+  obj[("Объектное хранилище, API S3<br/>pack-файлы тел закрытых недель")]
+  relay[("Kafka: топик relay-sender<br/>внешние пересылки")]:::planned
 
   clients -->|IMAPS| hap
   hap -->|"PROXY v2 + IMAP"| compute
@@ -47,7 +48,8 @@ flowchart LR
   queue -->|"Ingest: Broadway,<br/>групповая запись"| compute
   dir -.->|"зеркало в ETS"| compute
   compute -->|"шард по tenant"| storage
-  compute -.->|"Range GET"| obj
+  compute -->|"загрузка pack-файлов,<br/>Range GET"| obj
+  compute -.->|"копии на внешние адреса"| relay
 
   classDef planned stroke-dasharray: 5 5
 ```
@@ -59,7 +61,7 @@ flowchart LR
 | CPU на команды IMAP | BEAM-ноду (клиенты переподключаются и распределяются сами) |
 | CPU на TLS | экземпляр HAProxy |
 | Место или запись в БД | шард Postgres, перенос tenant без простоя |
-| Место под старые тела | объём объектного хранилища |
+| Место под старые тела | объём объектного хранилища (тела старше `cold_after_days` уходят туда) |
 
 ## 2. Дерево процессов BEAM-ноды
 
@@ -91,7 +93,7 @@ flowchart TB
   ms --> asup["AccountSupervisor<br/>DynamicSupervisor"]
   asup --> a1["AccountServer<br/>аккаунт 1"]
   asup --> a2["AccountServer<br/>аккаунт N"]
-  ms --> pm["PartitionMaintainer<br/>недельные партиции,<br/>дни deliveries"]
+  ms --> pm["PartitionMaintainer<br/>раз в 12 ч: партиции вперёд,<br/>дни deliveries, удаление по сроку,<br/>холодный слой"]
   ms --> place["Placement<br/>нода-владелец ящика,<br/>передача при смене состава"]
 
   app --> ing["Ingest<br/>(если включён)"]
@@ -126,6 +128,7 @@ flowchart LR
   directory["Directory<br/>кто существует, пароли,<br/>пересылки, правила доставки"]
   mailbox["Mailbox<br/>папки и письма,<br/>актор аккаунта"]
   shards["Shards<br/>tenant → repo шарда,<br/>реестр, перенос tenant"]
+  coldstore["ColdStore<br/>объектное хранилище:<br/>S3 API или каталог"]
   core["Core<br/>чистые функции: заголовки,<br/>флаги, классы, zstd"]
   telemetry["Telemetry"]
   repo[("Справочник<br/>(Repo)")]
@@ -138,6 +141,7 @@ flowchart LR
   ingest -->|deliver_many| delivery
   delivery -->|"deliver<br/>(групповая запись)"| mailbox
   mailbox -->|"repo(tenant)"| shards
+  mailbox -->|"pack-файлы, Range GET<br/>(Mailbox.Cold)"| coldstore
   shards -->|"shard_of"| directory
   shards --> shardrepo
   shards -->|"реестр шардов"| repo
@@ -170,7 +174,7 @@ sequenceDiagram
   B->>PG: INSERT deliveries ... ON CONFLICT DO NOTHING<br/>(уже доставленные отсеиваются)
   B->>PG: SELECT folders ... ORDER BY id FOR UPDATE
   B->>PG: UPDATE folders: uidnext, счётчики (одним запросом)
-  B->>PG: INSERT messages, message_bodies (всей пачкой)
+  B->>PG: INSERT messages, message_bodies (всей пачкой,<br/>партиция — политика хранения класса и неделя)
   B->>PG: COMMIT
   B--)A: {:delivered, folder, uids, counters}
   A--)C: {:exists, uids, folder}
@@ -236,7 +240,7 @@ sequenceDiagram
 
 ## 6. Схема данных
 
-Справочник (directory) — одна глобальная база со своей схемой (`priv/repo/migrations`): tenants, домены, ящики, пересылки, правила доставки, реестр шардов. Каждый шард — отдельная база со схемой шарда (`priv/shard/migrations`), в ней почта своих tenants. Внешних ключей и общих транзакций между ними нет. В разработке это базы одного сервера Postgres (`mailstore_dev`, `mailstore_dev_shard1`, ...). На диаграмме ниже обе схемы вместе, связи между ними логические.
+Справочник (directory) — одна глобальная база со своей схемой (`priv/repo/migrations`): tenants, домены (в том числе общие, без владельца), ящики, пересылки, правила доставки, реестр шардов. Каждый шард — отдельная база со схемой шарда (`priv/shard/migrations`), в ней почта своих tenants и адреса их тел в холодном слое (`cold_packs`, `cold_bodies`). Внешних ключей и общих транзакций между ними нет. В разработке это базы одного сервера Postgres (`mailstore_dev`, `mailstore_dev_shard1`, ...). На диаграмме ниже обе схемы вместе, связи между ними логические.
 
 ```mermaid
 erDiagram
@@ -347,6 +351,30 @@ erDiagram
     bytea key PK "sha256(получатель, байты), 16 байт"
     timestamptz created_at PK "ключ дневной партиции"
   }
+
+  messages ||--o| cold_bodies : "тело в холодном слое"
+  cold_packs ||--o{ cold_bodies : "где лежит"
+  tenants ||--o{ cold_packs : "pack-файлы tenant"
+
+  cold_packs {
+    bigint id PK "диапазон шарда, переезжает с tenant"
+    bigint tenant_id "из directory, без FK"
+    smallint retention
+    date week
+    text key UK "объект в хранилище"
+    bigint bytes
+    text state "uploading | stored"
+  }
+  cold_bodies {
+    bigint folder_id PK
+    bigint uid PK
+    timestamptz stored_at PK
+    smallint retention PK "партиции как у message_bodies"
+    bigint pack_id
+    bigint offset
+    int length
+    smallint codec
+  }
 ```
 
 Каждый шард выдаёт id папок из своего диапазона (`shard_id << 40`), поэтому папки переносятся между шардами с теми же id, UID, UIDVALIDITY и MODSEQ.
@@ -375,7 +403,6 @@ flowchart TB
   closed -->|"старше keep_days"| drop["DETACH CONCURRENTLY, итоги по папкам,<br/>счётчики папок порциями, DROP"]
   cold -->|"старше keep_days"| dropo["DROP cold_bodies недели,<br/>удаление её pack-файлов"]
 
-  classDef planned stroke-dasharray: 5 5
 ```
 
 **Удаление по сроку** (`Mailbox.apply_retention/1`) запускает `PartitionMaintainer` раз в 12 часов на каждой ноде. Для каждого шарда и каждой политики одновременно работает только один запуск: его держит advisory lock. Трафик удаление не блокирует, а упавший посреди дороги запуск продолжает следующий:
@@ -421,16 +448,17 @@ sequenceDiagram
   participant N as Все ноды
   participant W as Писатели<br/>(доставка, APPEND, STORE)
 
+  M->>S: блокировка обслуживания обоих шардов<br/>(ждёт идущее удаление по сроку и холодный слой)
   M->>S: снимок: HIGHESTMODSEQ и UIDNEXT каждой папки
   M->>T: партиции под недели и дни tenant
-  M->>T: копирование без блокировок: письма, тела,<br/>vanished, ключи доставки (ON CONFLICT DO NOTHING)
+  M->>T: копирование без блокировок: письма, тела,<br/>vanished, ключи доставки, cold_packs и cold_bodies<br/>(ON CONFLICT DO NOTHING)
   W->>S: запись продолжается
   rect rgba(128,128,128,0.15)
     Note over M,S: заморозка, одна транзакция на старом шарде
     M->>S: advisory lock tenant (стоп CREATE),<br/>SELECT folders ... FOR UPDATE
     W--xS: писатели ждут блокировку строк папок
-    M->>T: одна транзакция: строки папок, письма с UID ≥ снимка,<br/>флаги с MODSEQ > снимка, удалённые по vanished,<br/>новые ключи доставки
-    M->>S: UPDATE folders SET fenced = true, COMMIT
+    M->>T: одна транзакция: строки папок, письма с UID ≥ снимка,<br/>флаги с MODSEQ > снимка, удалённые по vanished<br/>(и их адреса в холодном слое), новые ключи доставки
+    M->>S: folders: fenced = true, cold_packs tenant удаляются<br/>(pack-файлы теперь принадлежат новому шарду), COMMIT
   end
   S-->>W: TenantMoved (папки fenced)
   M->>D: tenants.shard = новый
@@ -439,5 +467,7 @@ sequenceDiagram
   N--)N: сессии переподписываются и пересинхронизируются
   M->>S: позже: cleanup_moved, удаление строк tenant
 ```
+
+Pack-файлы tenant содержат только его письма, поэтому сами объекты не копируются: переезжают строки, которые на них указывают. Удаление по сроку на старом шарде их больше не видит и не трогает.
 
 Если перенос упал до коммита на старом шарде, tenant остаётся на месте, а частичные данные на новом шарде перезапишет следующая попытка. Если упал после коммита, но до переключения, tenant закрыт на старом шарде и ещё не виден на новом: писатели повторяют попытки, а `Move.finish/2` доводит переключение. Сам он пока не продолжает прерванный перенос: `finish` запускают вручную.
