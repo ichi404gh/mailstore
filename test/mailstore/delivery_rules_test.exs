@@ -7,7 +7,7 @@ defmodule Mailstore.DeliveryRulesTest do
     %{"rules" => rules} =
       "priv/delivery_rules/example.json" |> File.read!() |> Jason.decode!()
 
-    {:ok, 6} = Directory.import_global_rules(rules)
+    {:ok, 7} = Directory.import_global_rules(rules)
     tenant = tenant_fixture()
     bob = account_fixture("bob@acme.test", tenant: tenant)
     master = account_fixture("master@acme.test", tenant: tenant, kind: "master_inbox")
@@ -50,6 +50,13 @@ defmodule Mailstore.DeliveryRulesTest do
     assert {:ok, [{:stored, _, _, 1}]} = Delivery.deliver(raw, "bob@acme.test")
     assert ["X-Warmup-Vendor: VendorA\r\n" <> ^raw] = stored(bob)
     assert class_of(bob) == [1]
+    assert stored(master) == []
+  end
+
+  test "warmup flagged upstream (is_warmup) is not forwarded either", %{bob: bob, master: master} do
+    raw = raw_message()
+    assert {:ok, [{:stored, _, _, 1}]} = Delivery.deliver(raw, "bob@acme.test", class: :warmup)
+    assert [^raw] = stored(bob)
     assert stored(master) == []
   end
 

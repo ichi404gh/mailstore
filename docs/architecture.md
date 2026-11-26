@@ -255,7 +255,7 @@ erDiagram
   }
   domains {
     bigint id PK
-    bigint tenant_id FK
+    bigint tenant_id FK "NULL — общий домен"
     citext name UK
     text status
   }

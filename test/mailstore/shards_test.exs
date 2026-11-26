@@ -117,6 +117,28 @@ defmodule Mailstore.ShardsTest do
     assert length(messages_of(Shards.repo_for(shard), b)) == 3
   end
 
+  test "master inboxes on a shared domain live on their tenants' shards", %{shard: shard} do
+    {:ok, shared} = Directory.create_shared_domain("inbox.test")
+    one = tenant_fixture("one")
+    {:ok, two} = Directory.create_tenant(%{name: "two", shard: shard})
+    b = account_fixture("b@two.test", tenant: two)
+    {:ok, m1} = Directory.create_account(shared, "one-1", tenant: one, kind: "master_inbox")
+    {:ok, m2} = Directory.create_account(shared, "two-1", tenant: two, kind: "master_inbox")
+    {:ok, _} = Directory.create_forwarding(b, m2)
+
+    {:ok, [_, {:stored, m2_id, "INBOX", 1}]} = Delivery.deliver(raw_message(), b.address)
+    assert m2_id == m2.id
+
+    s2 = Shards.repo_for(shard)
+    assert length(messages_of(s2, m2)) == 1
+    assert count(s2, "SELECT count(*) FROM folders WHERE account_id = $1", [m1.id]) == 0
+    assert folder_id(m1, "INBOX") in (1 <<< 40)..((2 <<< 40) - 1)
+
+    # The master inbox moves with its tenant.
+    {:ok, _} = Shards.move_tenant(two.id, 1)
+    assert length(messages_of(Shards.repo_for(1), m2)) == 1
+  end
+
   test "a tenant moves while mail arrives and flags change: nothing lost, nothing doubled",
        %{shard: shard} do
     tenant = tenant_fixture("moving")

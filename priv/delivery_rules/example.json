@@ -103,6 +103,20 @@
       ]
     },
     {
+      "name": "NoWarmupForward",
+      "stage": "forward",
+      "position": 10,
+      "description": "Mail classed warmup, by the upstream flag (is_warmup) or by a detect rule, stays in the mailbox and is not forwarded.",
+      "test": {
+        "class": [
+          "warmup"
+        ]
+      },
+      "actions": [
+        "stop"
+      ]
+    },
+    {
       "name": "AutoReply",
       "stage": "forward",
       "position": 1000,

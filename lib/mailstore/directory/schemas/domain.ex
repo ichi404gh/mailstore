@@ -1,4 +1,5 @@
 defmodule Mailstore.Directory.Schemas.Domain do
+  @moduledoc "A mail domain: owned by a tenant, or shared (`tenant_id` nil) by many."
   use Mailstore.Schema
 
   schema "domains" do
@@ -11,7 +12,7 @@ defmodule Mailstore.Directory.Schemas.Domain do
   def changeset(domain, attrs) do
     domain
     |> cast(attrs, [:tenant_id, :name, :status])
-    |> validate_required([:tenant_id, :name])
+    |> validate_required([:name])
     |> update_change(:name, &String.downcase/1)
     |> unique_constraint(:name)
   end

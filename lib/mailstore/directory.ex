@@ -37,6 +37,16 @@ defmodule Mailstore.Directory do
     %Domain{} |> Domain.changeset(%{tenant_id: tenant_id, name: name}) |> Repo.insert()
   end
 
+  @doc """
+  A domain without an owner: accounts of any tenant can live in it, each created with
+  its tenant (`create_account(domain, local, tenant: tenant)`). For master inboxes of
+  all customers on one domain. Deleting a tenant removes its accounts there, not the
+  domain.
+  """
+  def create_shared_domain(name) do
+    %Domain{} |> Domain.changeset(%{tenant_id: nil, name: name}) |> Repo.insert()
+  end
+
   def get_domain_by_name(name), do: Repo.get_by(Domain, name: String.downcase(name))
 
   ## Accounts
@@ -46,17 +56,37 @@ defmodule Mailstore.Directory do
   (directory, then shard), so folder creation must be idempotent: it is.
   Pass `password:` to set a password (stored as a hash), or a ready `password_hash:`
   (bulk seeding hashes once).
+
+  The account belongs to the domain's tenant. In a shared domain
+  (`create_shared_domain/1`) pass the tenant: `tenant: %Tenant{}` (or `tenant_id:`);
+  without one it is `{:error, :tenant_required}`. A tenant other than the owner of an
+  owned domain is `{:error, :tenant_mismatch}`.
   """
   def create_account(%Domain{} = domain, local_part, attrs \\ %{}) do
     {password, attrs} = attrs |> Map.new() |> Map.pop(:password)
+    {tenant, attrs} = Map.pop(attrs, :tenant)
+    {tenant_id, attrs} = Map.pop(attrs, :tenant_id, tenant && tenant.id)
 
+    case account_tenant(domain, tenant_id) do
+      {:ok, tenant_id} -> insert_account(domain, local_part, tenant_id, password, attrs)
+      error -> error
+    end
+  end
+
+  defp account_tenant(%Domain{tenant_id: nil}, nil), do: {:error, :tenant_required}
+  defp account_tenant(%Domain{tenant_id: nil}, tenant_id), do: {:ok, tenant_id}
+  defp account_tenant(%Domain{tenant_id: owner}, nil), do: {:ok, owner}
+  defp account_tenant(%Domain{tenant_id: owner}, owner), do: {:ok, owner}
+  defp account_tenant(%Domain{}, _other), do: {:error, :tenant_mismatch}
+
+  defp insert_account(domain, local_part, tenant_id, password, attrs) do
     attrs =
       attrs
       |> then(fn a ->
         if password, do: Map.put(a, :password_hash, Password.hash(password)), else: a
       end)
       |> Map.merge(%{
-        tenant_id: domain.tenant_id,
+        tenant_id: tenant_id,
         domain_id: domain.id,
         local_part: local_part,
         address: "#{local_part}@#{domain.name}"
