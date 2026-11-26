@@ -34,6 +34,9 @@ defmodule Mailstore.Directory.Cache do
   alias Mailstore.Directory.Schemas.{Account, DeliveryRule, Forwarding, Tenant}
   alias Mailstore.Repo
 
+  # How long after stamping its rows a directory transaction may still commit.
+  @late_commit_s 5
+
   @accounts :mailstore_dir_accounts
   @addresses :mailstore_dir_addresses
   @forwardings :mailstore_dir_forwardings
@@ -284,10 +287,22 @@ defmodule Mailstore.Directory.Cache do
     }
   end
 
-  # `>=` so rows sharing the boundary timestamp are not missed (re-applying is harmless).
+  # Rows stamped after the last one seen, and, while they are recent, also those at the
+  # same or a slightly earlier stamp: a transaction commits after it stamps its rows, so
+  # rows can appear behind the boundary for a moment (re-applying them is harmless).
+  # Only recent ones, or a bulk change that stamped many rows alike would be read again
+  # on every poll until a newer row comes along.
   defp changed_since(schema, since) do
     query = from(r in schema, order_by: r.updated_at)
-    query = if since, do: from(r in query, where: r.updated_at >= ^since), else: query
+
+    query =
+      if since,
+        do:
+          from(r in query,
+            where: r.updated_at > ^since or r.updated_at >= ago(@late_commit_s, "second")
+          ),
+        else: query
+
     rows = Repo.all(query)
     {Enum.map(rows, &compact/1), Enum.reduce(rows, since, &max_time(&2, &1.updated_at))}
   end

@@ -91,6 +91,32 @@ defmodule Mailstore.ShardsTest do
     assert folder_id(a, "INBOX") in (1 <<< 40)..((2 <<< 40) - 1)
   end
 
+  test "one batch for both shards: each part in its shard's transaction, results in order",
+       %{shard: shard} do
+    t1 = tenant_fixture("one")
+    {:ok, t2} = Directory.create_tenant(%{name: "two", shard: shard})
+    a = account_fixture("a@one.test", tenant: t1)
+    b = account_fixture("b@two.test", tenant: t2)
+
+    items =
+      for {account, i} <- Enum.with_index([a, b, a, b, b]) do
+        %{account_id: account.id, tenant_id: account.tenant_id, msg: new_message(subject: "#{i}")}
+      end
+
+    assert {:ok, results} = Mailbox.deliver(items)
+
+    assert results == [
+             {:stored, a.id, "INBOX", 1},
+             {:stored, b.id, "INBOX", 1},
+             {:stored, a.id, "INBOX", 2},
+             {:stored, b.id, "INBOX", 2},
+             {:stored, b.id, "INBOX", 3}
+           ]
+
+    assert length(messages_of(Shards.repo_for(1), a)) == 2
+    assert length(messages_of(Shards.repo_for(shard), b)) == 3
+  end
+
   test "a tenant moves while mail arrives and flags change: nothing lost, nothing doubled",
        %{shard: shard} do
     tenant = tenant_fixture("moving")

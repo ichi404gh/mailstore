@@ -66,6 +66,58 @@ defmodule Mailstore.Directory.CacheTest do
     assert {:error, :unknown_recipient} = Directory.lookup_account("bob@acme.test")
   end
 
+  test "rows stamped alike by a bulk change are read once, not on every poll" do
+    tenant = tenant_fixture("bulk")
+    {:ok, domain} = Directory.create_domain(tenant, "bulk.test")
+    stamp = DateTime.add(DateTime.utc_now(), -60)
+    # The bulk stamp is the newest one the cache has seen.
+    Repo.query!("UPDATE accounts SET updated_at = $1", [DateTime.add(stamp, -60)])
+
+    Repo.query!(
+      """
+      INSERT INTO accounts (tenant_id, domain_id, local_part, address, inserted_at, updated_at)
+      SELECT $1, $2, 'u' || i, 'u' || i || '@bulk.test', $3, $3 FROM generate_series(1, 500) i
+      """,
+      [tenant.id, domain.id, stamp]
+    )
+
+    send(Cache, :full_reload)
+    Cache.refresh()
+    assert {:ok, _} = Directory.lookup_account("u500@bulk.test")
+    assert rows_read(&Cache.refresh/0) == 0
+  end
+
+  # Rows the cache process read from accounts during `fun`.
+  defp rows_read(fun) do
+    test_pid = self()
+    id = {:rows, make_ref()}
+    cache = Process.whereis(Cache)
+
+    :telemetry.attach(
+      id,
+      [:mailstore, :repo, :query],
+      fn _, _, meta, _ ->
+        with true <- self() == cache,
+             "accounts" <- meta[:source],
+             {:ok, %{num_rows: n}} <- meta[:result],
+             do: send(test_pid, {id, n})
+      end,
+      nil
+    )
+
+    fun.()
+    :telemetry.detach(id)
+    sum_rows(id, 0)
+  end
+
+  defp sum_rows(id, n) do
+    receive do
+      {^id, rows} -> sum_rows(id, n + rows)
+    after
+      0 -> n
+    end
+  end
+
   test "a successful LOGIN is remembered; a password change invalidates it", %{bob: bob} do
     refute Cache.auth_ok?(Directory.get_account(bob.id), "secret")
     assert {:ok, _} = Directory.authenticate("bob@acme.test", "secret")

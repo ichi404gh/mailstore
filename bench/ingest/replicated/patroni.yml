@@ -1,0 +1,46 @@
+# Scope (cluster name) and addresses come from PATRONI_* variables in compose.yml.
+namespace: /service/
+restapi:
+  listen: 0.0.0.0:8008
+etcd3:
+  hosts: etcd:2379
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    # A commit returns once the standby has it: a failover loses nothing.
+    synchronous_mode: true
+    postgresql:
+      use_pg_rewind: true
+      parameters:
+        max_connections: 200
+        # The folder table of 430k mailboxes (~420 MB with indexes) has to stay in
+        # memory: every delivery goes to a random mailbox.
+        shared_buffers: 1GB
+        wal_log_hints: "on"
+        max_wal_senders: 10
+        max_replication_slots: 10
+        # Every delivery updates a random folder row: after each checkpoint the first
+        # change to a page writes the whole page to WAL. Fewer checkpoints and
+        # compressed page images cut WAL (and what the standby receives) several times.
+        wal_compression: zstd
+        max_wal_size: 8GB
+        checkpoint_timeout: 15min
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+postgresql:
+  listen: 0.0.0.0:5432
+  data_dir: /var/lib/postgresql/data/patroni
+  bin_dir: /usr/lib/postgresql/17/bin
+  pgpass: /tmp/pgpass
+  authentication:
+    superuser: {username: postgres, password: postgres}
+    replication: {username: replicator, password: rep}
+    rewind: {username: postgres, password: postgres}
+  pg_hba:
+    - local all all trust
+    - host replication replicator all md5
+    - host all all all md5

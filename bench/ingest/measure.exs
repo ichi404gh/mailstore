@@ -65,13 +65,17 @@ cpu_ms = fn ->
   round((mins * 60 + secs) * 1000)
 end
 
+# --pg-container a,b,c sums the containers (primaries and standbys of all shards).
 pg_ms = fn ->
-  with name when is_binary(name) <- pg,
-       {out, 0} <- System.cmd("docker", ["exec", name, "cat", "/sys/fs/cgroup/cpu.stat"]) do
-    [_, us] = Regex.run(~r/usage_usec (\d+)/, out)
-    div(String.to_integer(us), 1000)
-  else
-    _ -> nil
+  if pg do
+    pg
+    |> String.split(",", trim: true)
+    |> Enum.map(fn name ->
+      {out, 0} = System.cmd("docker", ["exec", name, "cat", "/sys/fs/cgroup/cpu.stat"])
+      [_, us] = Regex.run(~r/usage_usec (\d+)/, out)
+      div(String.to_integer(us), 1000)
+    end)
+    |> Enum.sum()
   end
 end
 

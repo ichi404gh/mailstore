@@ -98,32 +98,57 @@ defmodule Mailstore.Mailbox do
     |> then(&{:ok, &1})
   end
 
-  # One transaction per shard. A group that hits a tenant moved away (fenced folders)
-  # is rolled back; its items are grouped again once the directory says where they
-  # live now.
+  # One transaction per shard, the shards in parallel: their transactions are
+  # independent, and each waits for its own commit (and standby). A group that hits a
+  # tenant moved away (fenced folders) is rolled back; its items are grouped again once
+  # the directory says where they live now.
   defp deliver_groups(indexed, attempts) do
-    indexed
-    |> Enum.group_by(fn {item, _i} -> Shards.repo(item.tenant_id) end)
-    |> Enum.flat_map(fn {repo, group} ->
-      {items, indexes} = Enum.unzip(group)
+    case Enum.group_by(indexed, fn {item, _i} -> Shards.repo(item.tenant_id) end) do
+      groups when map_size(groups) == 1 ->
+        Enum.flat_map(groups, &deliver_group(&1, attempts))
 
-      case deliver_tx(repo, items, 3) do
-        {results, updates} ->
-          for u <- updates, do: AccountServer.delivered(u.account_id, u)
+      groups ->
+        groups
+        |> Task.async_stream(
+          fn group ->
+            try do
+              {:ok, deliver_group(group, attempts)}
+            rescue
+              e -> {:raise, e, __STACKTRACE__}
+            end
+          end,
+          max_concurrency: map_size(groups),
+          ordered: false,
+          timeout: :infinity
+        )
+        # A shard's error is raised here, in the caller, as it would be without tasks
+        # (the other shards' parts may have committed: replaying the batch is safe).
+        |> Enum.flat_map(fn
+          {:ok, {:ok, results}} -> results
+          {:ok, {:raise, e, stacktrace}} -> reraise(e, stacktrace)
+        end)
+    end
+  end
 
-          Enum.zip_with([indexes, items, results], fn [i, item, result] ->
-            {i, result(item, result)}
-          end)
+  defp deliver_group({repo, group}, attempts) do
+    {items, indexes} = Enum.unzip(group)
 
-        :tenant_moved when attempts > 1 ->
-          Mailstore.Directory.Cache.refresh()
-          Process.sleep(100)
-          deliver_groups(group, attempts - 1)
+    case deliver_tx(repo, items, 3) do
+      {results, updates} ->
+        for u <- updates, do: AccountServer.delivered(u.account_id, u)
 
-        :tenant_moved ->
-          raise Mailstore.Shards.TenantMoved, "tenant still fenced after retries"
-      end
-    end)
+        Enum.zip_with([indexes, items, results], fn [i, item, result] ->
+          {i, result(item, result)}
+        end)
+
+      :tenant_moved when attempts > 1 ->
+        Mailstore.Directory.Cache.refresh()
+        Process.sleep(100)
+        deliver_groups(group, attempts - 1)
+
+      :tenant_moved ->
+        raise Mailstore.Shards.TenantMoved, "tenant still fenced after retries"
+    end
   end
 
   # A deadlock (with an actor's MOVE locking two folders) or a serialization failure

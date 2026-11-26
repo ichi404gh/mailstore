@@ -1,0 +1,38 @@
+# Two shards, each a Patroni cluster of a primary and a synchronous standby, behind
+# HAProxy: shard 1 on localhost:55501, shard 2 on localhost:55502. See bench/README.md.
+name: mailstore-replicated
+x-pg: &pg
+  build: .
+  image: mailstore-patroni:17
+  depends_on: [etcd]
+  shm_size: 512m
+services:
+  # etcd in memory: on one machine it shares the disk with four Postgres instances, and
+  # its fsyncs waited behind their WAL long enough for Patroni to demote a primary.
+  # In production etcd gets a disk of its own.
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.17
+    tmpfs: [/etcd-data]
+    command: [etcd, --name, etcd, --data-dir, /etcd-data, --unsafe-no-fsync,
+              --listen-client-urls, "http://0.0.0.0:2379", --advertise-client-urls, "http://etcd:2379"]
+  s1a:
+    <<: *pg
+    hostname: s1a
+    environment: {PATRONI_SCOPE: shard1, PATRONI_NAME: s1a, PATRONI_RESTAPI_CONNECT_ADDRESS: "s1a:8008", PATRONI_POSTGRESQL_CONNECT_ADDRESS: "s1a:5432"}
+  s1b:
+    <<: *pg
+    hostname: s1b
+    environment: {PATRONI_SCOPE: shard1, PATRONI_NAME: s1b, PATRONI_RESTAPI_CONNECT_ADDRESS: "s1b:8008", PATRONI_POSTGRESQL_CONNECT_ADDRESS: "s1b:5432"}
+  s2a:
+    <<: *pg
+    hostname: s2a
+    environment: {PATRONI_SCOPE: shard2, PATRONI_NAME: s2a, PATRONI_RESTAPI_CONNECT_ADDRESS: "s2a:8008", PATRONI_POSTGRESQL_CONNECT_ADDRESS: "s2a:5432"}
+  s2b:
+    <<: *pg
+    hostname: s2b
+    environment: {PATRONI_SCOPE: shard2, PATRONI_NAME: s2b, PATRONI_RESTAPI_CONNECT_ADDRESS: "s2b:8008", PATRONI_POSTGRESQL_CONNECT_ADDRESS: "s2b:5432"}
+  haproxy:
+    image: haproxy:3.0
+    volumes: ["./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"]
+    ports: ["55501:5001", "55502:5002"]
+    depends_on: [s1a, s1b, s2a, s2b]
