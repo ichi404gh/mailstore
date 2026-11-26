@@ -25,3 +25,6 @@ config :logger, level: :warning
 config :mailstore, :imap, enabled: true, port: 0, proxy_port: 0, num_acceptors: 4
 
 config :mailstore, :pbkdf2_iterations, 1_000
+
+# Tests run retention themselves (Mailbox.apply_retention/1) with their own dates.
+config :mailstore, :retention, schedule: false

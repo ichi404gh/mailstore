@@ -33,6 +33,21 @@ config :mailstore, :directory_cache,
   full_reload_ms: :timer.minutes(10),
   auth_ttl_ms: :timer.hours(1)
 
+# Retention (Mailstore.Mailbox.Retention): how long mail is kept per policy, and when
+# its bodies may go to the cold tier; message classes map to policies. A week is dropped
+# once it ended more than keep_days ago. Never reuse a policy id for another policy.
+# MAILSTORE_RETENTION (JSON, see config/runtime.exs) overrides this at runtime.
+config :mailstore, :retention,
+  policies: [
+    standard: [id: 0, keep_days: 365, cold_after_days: 30],
+    # Incoming warmup is not read after a couple of days.
+    short: [id: 1, keep_days: 30]
+  ],
+  classes: [warmup: :short],
+  default: :standard,
+  # Run expiry from Mailbox.PartitionMaintainer (every 12 h on every node).
+  schedule: true
+
 # Inbound queue: Kafka topics filled by the SMTP layer (see Mailstore.Ingest). Off by
 # default; MAILSTORE_KAFKA_HOSTS turns it on (config/runtime.exs).
 config :mailstore, :ingest,

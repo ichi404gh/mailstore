@@ -6,6 +6,7 @@ defmodule Mailstore.Mailbox.Schemas.MessageBody do
     field :folder_id, :integer, primary_key: true
     field :uid, :integer, primary_key: true
     field :stored_at, :utc_datetime_usec, primary_key: true
+    field :retention, :integer, primary_key: true
     field :codec, :integer
     field :data, :binary
   end

@@ -20,6 +20,7 @@ defmodule Mailstore.Mailbox.Commands do
   """
   import Bitwise
   alias Mailstore.Core.{BodyCodec, Flags}
+  alias Mailstore.Mailbox.Retention
   alias Mailstore.Mailbox.Schemas.{Message, MessageBody}
 
   @counters "uidnext, highest_modseq, messages_count, unseen_count"
@@ -262,6 +263,7 @@ defmodule Mailstore.Mailbox.Commands do
 
   defp rows(m, tenant_id, folder_id, uid, modseq, stored_at) do
     {codec, data} = m.body || BodyCodec.encode(m.raw)
+    retention = Retention.policy_id(m.class)
 
     {%{
        tenant_id: tenant_id,
@@ -269,6 +271,7 @@ defmodule Mailstore.Mailbox.Commands do
        uid: uid,
        modseq: modseq,
        stored_at: stored_at,
+       retention: retention,
        internal_date: m.internal_date,
        size: m.size,
        flags: m.flags_mask,
@@ -282,10 +285,18 @@ defmodule Mailstore.Mailbox.Commands do
        subject: m.subject,
        envelope: m.envelope,
        bodystructure: m.bodystructure
-     }, %{folder_id: folder_id, uid: uid, stored_at: stored_at, codec: codec, data: data}}
+     },
+     %{
+       folder_id: folder_id,
+       uid: uid,
+       stored_at: stored_at,
+       retention: retention,
+       codec: codec,
+       data: data
+     }}
   end
 
-  # Postgres takes at most 65 535 parameters per statement: 18 columns x 1 000 rows fits.
+  # Postgres takes at most 65 535 parameters per statement: 19 columns x 1 000 rows fits.
   defp insert_rows(repo, meta, bodies) do
     for chunk <- Enum.chunk_every(meta, 1_000), do: repo.insert_all(Message, chunk)
     for chunk <- Enum.chunk_every(bodies, 1_000), do: repo.insert_all(MessageBody, chunk)
@@ -318,11 +329,11 @@ defmodule Mailstore.Mailbox.Commands do
       repo.query!(
         """
         WITH t AS (
-          SELECT uid, stored_at, flags AS old_flags, keywords AS old_kw
+          SELECT uid, stored_at, retention, flags AS old_flags, keywords AS old_kw
           FROM messages WHERE folder_id = $1 AND uid = ANY($2)
           FOR UPDATE
         ), c AS (
-          SELECT uid, stored_at, old_flags, old_kw,
+          SELECT uid, stored_at, retention, old_flags, old_kw,
                  (#{flags_expr}) AS new_flags, (#{kw_expr}) AS new_kw
           FROM t
         )
@@ -330,6 +341,7 @@ defmodule Mailstore.Mailbox.Commands do
         SET flags = c.new_flags, keywords = c.new_kw, modseq = $5
         FROM c
         WHERE m.folder_id = $1 AND m.uid = c.uid AND m.stored_at = c.stored_at
+          AND m.retention = c.retention
           AND (c.new_flags <> c.old_flags OR c.new_kw <> c.old_kw)
         RETURNING m.uid, m.flags, m.keywords, c.old_flags
         """,
@@ -378,10 +390,11 @@ defmodule Mailstore.Mailbox.Commands do
         WITH del AS (
           DELETE FROM messages
           WHERE folder_id = $1 AND (flags & #{Flags.deleted()}) <> 0 #{uid_filter}
-          RETURNING uid, stored_at, flags
+          RETURNING uid, stored_at, retention, flags
         ), delb AS (
           DELETE FROM message_bodies b USING del
           WHERE b.folder_id = $1 AND b.uid = del.uid AND b.stored_at = del.stored_at
+            AND b.retention = del.retention
           RETURNING 1
         ), van AS (
           INSERT INTO vanished (folder_id, uid, modseq)
@@ -452,11 +465,11 @@ defmodule Mailstore.Mailbox.Commands do
 
       repo.query!(
         """
-        INSERT INTO messages (tenant_id, folder_id, uid, modseq, stored_at, internal_date, size,
-          flags, keywords, class, message_id, message_id_h, in_reply_to_h, thread_id,
-          from_addr, subject, envelope, bodystructure)
+        INSERT INTO messages (tenant_id, folder_id, uid, modseq, stored_at, retention,
+          internal_date, size, flags, keywords, class, message_id, message_id_h, in_reply_to_h,
+          thread_id, from_addr, subject, envelope, bodystructure)
         SELECT tenant_id, $2, $3 + row_number() OVER (ORDER BY uid) - 1,
-          $4 + row_number() OVER (ORDER BY uid) - 1, $5, internal_date, size,
+          $4 + row_number() OVER (ORDER BY uid) - 1, $5, retention, internal_date, size,
           flags, keywords, class, message_id, message_id_h, in_reply_to_h, thread_id,
           from_addr, subject, envelope, bodystructure
         FROM messages WHERE folder_id = $1 AND uid = ANY($6)
@@ -466,8 +479,8 @@ defmodule Mailstore.Mailbox.Commands do
 
       repo.query!(
         """
-        INSERT INTO message_bodies (folder_id, uid, stored_at, codec, data)
-        SELECT $2, $3 + row_number() OVER (ORDER BY uid) - 1, $4, codec, data
+        INSERT INTO message_bodies (folder_id, uid, stored_at, retention, codec, data)
+        SELECT $2, $3 + row_number() OVER (ORDER BY uid) - 1, $4, retention, codec, data
         FROM message_bodies WHERE folder_id = $1 AND uid = ANY($5)
         """,
         [src_folder_id, dst_folder_id, first_uid, stored_at, src_uids]

@@ -7,6 +7,8 @@ defmodule Mailstore.Mailbox.Schemas.Message do
     field :folder_id, :integer, primary_key: true
     field :uid, :integer, primary_key: true
     field :stored_at, :utc_datetime_usec, primary_key: true
+    # Retention policy (Mailstore.Mailbox.Retention), part of the partition key.
+    field :retention, :integer, primary_key: true
     field :tenant_id, :integer
     field :modseq, :integer
     field :internal_date, :utc_datetime_usec

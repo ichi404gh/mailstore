@@ -18,7 +18,7 @@ defmodule Mailstore.Mailbox do
   (read queries), `Schemas.*`, `Partitions` (retention).
   """
   alias Mailstore.Core.{BodyCodec, Flags, NewMessage}
-  alias Mailstore.Mailbox.{AccountServer, Commands, Partitions, Queries}
+  alias Mailstore.Mailbox.{AccountServer, Commands, Partitions, Queries, Retention}
   alias Mailstore.Mailbox.Schemas.Folder
   alias Mailstore.Shards
 
@@ -265,17 +265,22 @@ defmodule Mailstore.Mailbox do
   @doc "Make sure partitions exist on every shard."
   def ensure_partitions, do: Enum.each(Shards.all(), &Partitions.ensure/1)
 
-  @doc "Retention: drop the weeks that end before `cutoff`, on every shard."
-  def drop_partitions_before(cutoff) do
-    Shards.all()
-    |> Enum.map(fn repo -> elem(Partitions.drop_before(repo, cutoff), 1) end)
-    |> Enum.reduce(%{dropped: [], affected_folders: []}, fn r, acc ->
-      %{
-        dropped: acc.dropped ++ r.dropped,
-        affected_folders: acc.affected_folders ++ r.affected_folders
-      }
-    end)
-    |> then(&{:ok, &1})
+  @doc """
+  Retention (`Mailbox.Retention`): on every shard, drop each policy's weeks that ended
+  more than its `keep_days` before `today`, and fix the folder counters. Then every
+  account actor in the cluster reloads, and selected sessions see `EXPUNGE` for what
+  went. Returns `{:ok, %{weeks: [table], folder_updates: n}}`.
+  """
+  def apply_retention(today \\ Date.utc_today()) do
+    results =
+      for repo <- Shards.all(), policy <- Retention.policies() do
+        Partitions.expire(repo, policy.id, Date.add(today, -policy.keep_days))
+      end
+
+    weeks = Enum.flat_map(results, & &1.weeks)
+    folders = results |> Enum.map(& &1.folder_updates) |> Enum.sum()
+    if weeks != [] or folders > 0, do: AccountServer.reload_all()
+    {:ok, %{weeks: weeks, folder_updates: folders}}
   end
 
   defp run(tenant_id, fun, query), do: apply(Shards.repo(tenant_id), fun, [query])

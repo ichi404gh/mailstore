@@ -70,9 +70,10 @@ if n = opts[:fill] do
     :timer.tc(fn ->
       shard.query!(
         """
-        INSERT INTO messages (tenant_id, folder_id, uid, modseq, stored_at, internal_date, size,
-                              flags, keywords, class, message_id, from_addr, subject)
-        SELECT f.tenant_id, f.id, g, g + 1, now(), now() - (($2 - g) * interval '20 minutes'), 2000,
+        INSERT INTO messages (tenant_id, folder_id, uid, modseq, stored_at, retention, internal_date,
+                              size, flags, keywords, class, message_id, from_addr, subject)
+        SELECT f.tenant_id, f.id, g, g + 1, now(), #{Mailstore.Mailbox.Retention.policy_id(:reply)},
+               now() - (($2 - g) * interval '20 minutes'), 2000,
                CASE WHEN g <= $2 - 10 THEN 1 ELSE 0 END, '{}', 2,
                '<bulk-' || f.id || '-' || g || '@load>', 'sender@example.org', 'bulk ' || g
         FROM folders f

@@ -4,6 +4,9 @@ defmodule Mailstore.Application do
 
   @impl true
   def start(_type, _args) do
+    # A bad retention configuration stops the start, not the first delivery.
+    Mailstore.Mailbox.Retention.load!()
+
     children =
       [
         Mailstore.Telemetry,

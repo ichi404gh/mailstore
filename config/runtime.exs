@@ -86,6 +86,25 @@ if hosts = System.get_env("MAILSTORE_KAFKA_HOSTS") do
   config :mailstore, :ingest, ingest
 end
 
+# Retention policies as JSON, e.g.
+#   MAILSTORE_RETENTION='{"policies": {"standard": {"id": 0, "keep_days": 365, "cold_after_days": 30},
+#                                      "short": {"id": 1, "keep_days": 30}},
+#                         "classes": {"warmup": "short"}, "default": "standard"}'
+if json = System.get_env("MAILSTORE_RETENTION") do
+  r = Jason.decode!(json)
+  atom = &String.to_atom/1
+
+  policies =
+    for {name, p} <- Map.fetch!(r, "policies"),
+        do: {atom.(name), Enum.map(p, fn {k, v} -> {atom.(k), v} end)}
+
+  config :mailstore, :retention,
+    policies: policies,
+    classes:
+      for({class, policy} <- Map.get(r, "classes", %{}), do: {atom.(class), atom.(policy)}),
+    default: atom.(Map.get(r, "default", "standard"))
+end
+
 # A single-shard production install: the shard's database (created and owned by the
 # platform, not by mailstore); further shards are added with Mailstore.Shards.register/3.
 if url = System.get_env("MAILSTORE_SHARD1_URL") do

@@ -1,7 +1,9 @@
 defmodule Mailstore.Mailbox.PartitionMaintainer do
   @moduledoc """
-  Keeps future partitions created and drops `deliveries` days older than the dedup
-  horizon (`:delivery_dedup_days`). Message retention drops are a separate, explicit job.
+  Keeps future partitions created, drops `deliveries` days older than the dedup
+  horizon (`:delivery_dedup_days`) and applies retention (`Mailbox.apply_retention/1`)
+  unless `config :mailstore, :retention, schedule: false`. Every node runs it; per
+  shard and policy only one expiry runs at a time (an advisory lock).
   """
   use GenServer
   require Logger
@@ -26,6 +28,17 @@ defmodule Mailstore.Mailbox.PartitionMaintainer do
         Mailstore.Mailbox.Partitions.drop_deliveries_before(repo, cutoff)
       rescue
         e -> Logger.warning("partition maintenance skipped: #{Exception.message(e)}")
+      end
+    end
+
+    if Keyword.get(Application.get_env(:mailstore, :retention, []), :schedule, true) do
+      try do
+        {:ok, %{weeks: weeks, folder_updates: n}} = Mailstore.Mailbox.apply_retention()
+
+        if weeks != [],
+          do: Logger.info("retention: dropped #{inspect(weeks)}, #{n} folder updates")
+      rescue
+        e -> Logger.warning("retention skipped: #{Exception.message(e)}")
       end
     end
 

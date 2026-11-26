@@ -158,7 +158,7 @@ defmodule Mailstore.Shards.Move do
     if oldest do
       from = DateTime.to_date(oldest)
       weeks = div(Date.diff(Date.utc_today(), from), 7) + 13
-      target.query!("SELECT mailstore_ensure_partitions($1, $2)", [from, weeks])
+      Mailstore.Mailbox.Partitions.ensure(target, from, weeks)
     end
 
     %{rows: [[first_day]]} =
