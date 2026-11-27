@@ -131,7 +131,7 @@ flowchart LR
   mailbox["Mailbox<br/>папки и письма,<br/>актор аккаунта"]
   shards["Shards<br/>tenant → repo шарда,<br/>реестр, перенос tenant"]
   coldstore["ColdStore<br/>объектное хранилище:<br/>S3 API или каталог"]
-  outbound["Outbound<br/>внешние пересылки;<br/>адаптер Kafka: топик relay-sender"]
+  outbound["Outbound<br/>внешние пересылки,<br/>адаптер Kafka: топик relay-sender"]
   core["Core<br/>чистые функции: заголовки,<br/>флаги, классы, zstd"]
   telemetry["Telemetry"]
   repo[("Справочник<br/>(Repo)")]
@@ -169,7 +169,7 @@ sequenceDiagram
   participant PG as Шард Postgres
   participant A as AccountServer<br/>(если запущен)
   participant C as Connection<br/>(сессия в IDLE)
-  participant R as Kafka: топик<br/>relay-sender
+  participant R as Kafka, топик<br/>relay-sender
 
   K->>P: записи (JSON)
   P->>DC: lookup_account, forwardings_for, rules_for
@@ -180,7 +180,7 @@ sequenceDiagram
     B->>R: записи пересылок, ждём подтверждения всех
   end
   B->>PG: BEGIN
-  B->>PG: INSERT deliveries ... ON CONFLICT DO NOTHING<br/>(уже доставленные отсеиваются; ключи пересылок)
+  B->>PG: INSERT deliveries ... ON CONFLICT DO NOTHING<br/>(уже доставленные отсеиваются, ключи пересылок)
   B->>PG: SELECT folders ... ORDER BY id FOR UPDATE
   B->>PG: UPDATE folders: uidnext, счётчики (одним запросом)
   B->>PG: INSERT messages, message_bodies (всей пачкой,<br/>партиция — политика хранения класса и неделя)
