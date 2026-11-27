@@ -86,6 +86,35 @@ if hosts = System.get_env("MAILSTORE_KAFKA_HOSTS") do
   config :mailstore, :ingest, ingest
 end
 
+# Outbound through the relay sender's Kafka topic, e.g.
+#   MAILSTORE_OUTBOUND_KAFKA_TOPIC=relay.forwards MAILSTORE_OUTBOUND_KAFKA_RELAY=front-relay
+# The Kafka cluster is MAILSTORE_OUTBOUND_KAFKA_HOSTS, else the inbound one
+# (MAILSTORE_KAFKA_HOSTS).
+if topic = System.get_env("MAILSTORE_OUTBOUND_KAFKA_TOPIC") do
+  hosts =
+    for hp <-
+          String.split(
+            System.get_env("MAILSTORE_OUTBOUND_KAFKA_HOSTS") ||
+              System.fetch_env!("MAILSTORE_KAFKA_HOSTS"),
+            ",",
+            trim: true
+          ) do
+      [host, port] = String.split(hp, ":")
+      {String.to_atom(host), String.to_integer(port)}
+    end
+
+  config :mailstore,
+         :outbound,
+         Application.get_env(:mailstore, :outbound, [])
+         |> Keyword.merge(
+           enabled: true,
+           adapter: Mailstore.Outbound.Kafka,
+           hosts: hosts,
+           topic: topic,
+           relay: System.fetch_env!("MAILSTORE_OUTBOUND_KAFKA_RELAY")
+         )
+end
+
 # Retention policies as JSON, e.g.
 #   MAILSTORE_RETENTION='{"policies": {"standard": {"id": 0, "keep_days": 365, "cold_after_days": 30},
 #                                      "short": {"id": 1, "keep_days": 30}},

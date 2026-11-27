@@ -11,13 +11,13 @@ defmodule Mailstore.Delivery do
   * Forwarding (`Directory.forwardings_for/2`): a copy for a master inbox (`copy`) or
     only the copy (`redirect`); warmup is filtered by `only_classes`. A copy is stored
     directly in the target mailbox and never routed again (one hop, no loops).
-  * External targets come back as `{:external, address}`. Sending (SRS, ARC, outbound
-    queue) is out of scope for this prototype.
+  * External targets come back as `{:external, address}` and are sent out
+    (`forward/1`, `Mailstore.Outbound`) before anything is stored.
 
   The original and its copies are stored in one transaction, together with everything
-  else in the batch (`Mailstore.Mailbox.deliver/1`).
+  else in the batch and the keys of its sent forwards (`Mailstore.Mailbox.deliver/1`).
   """
-  alias Mailstore.{Directory, Mailbox}
+  alias Mailstore.{Directory, Mailbox, Outbound}
   alias Mailstore.Core.{NewMessage, Rules}
 
   @type result ::
@@ -29,7 +29,8 @@ defmodule Mailstore.Delivery do
 
   @doc """
   Deliver one message. Options: `:class`, `:internal_date`, `:key` (identifies the
-  delivery: the same key to the same account is stored once).
+  delivery: the same key to the same account is stored once, and forwarded once),
+  `:sender` (the envelope sender, used for forwards).
   """
   @spec deliver(binary, String.t(), keyword) :: {:ok, [result]} | {:error, :unknown_recipient}
   def deliver(raw, rcpt, opts \\ []) do
@@ -39,16 +40,17 @@ defmodule Mailstore.Delivery do
 
   @doc """
   Deliver many messages in one group commit per shard. Each entry: `%{rcpt, raw}`, plus
-  optional `class`, `internal_date`, `key`. One result per entry, in order:
+  optional `class`, `internal_date`, `key`, `sender`. One result per entry, in order:
   `{:ok, [result]}` or `{:error, :unknown_recipient}`.
   """
-  def deliver_many(entries), do: entries |> Enum.map(&plan/1) |> store()
+  def deliver_many(entries), do: entries |> Enum.map(&plan/1) |> forward() |> store()
 
   @doc """
   Everything up to the write, and the CPU-heavy part (rules, MIME, envelope, zstd), so
   ingest runs it in parallel processors. Returns `{:ok, plan}` or
-  `{:error, :unknown_recipient}`; the plan carries the items to store, external
-  targets, whether the original was discarded, and the names of the rules that matched.
+  `{:error, :unknown_recipient}`; the plan carries the items to store, the forwards to
+  external targets (`Outbound.new/1`), whether the original was discarded, and the
+  names of the rules that matched.
   """
   def plan(entry) do
     with {:ok, account} <- Directory.lookup_account(entry.rcpt) do
@@ -76,7 +78,7 @@ defmodule Mailstore.Delivery do
             # A redirect to one of our own mailboxes (e.g. the bounce mailbox) is stored.
             case Directory.lookup_account(address) do
               {:ok, target} -> {[{target.id, target.tenant_id, bytes} | copies], ext}
-              _ -> {copies, [address | ext]}
+              _ -> {copies, [{address, bytes} | ext]}
             end
         end)
 
@@ -88,24 +90,76 @@ defmodule Mailstore.Delivery do
          account_id: account.id,
          items:
            for({id, tenant_id, bytes} <- targets, do: item(id, tenant_id, msgs[bytes], entry)),
-         external: Enum.reverse(external),
+         external:
+           for(
+             {address, bytes} <- Enum.reverse(external),
+             do: forward(account, address, bytes, entry, outcome.class)
+           ),
          discarded: outcome.discarded,
          matched: outcome.matched
        }}
     end
   end
 
-  @doc "Store planned deliveries: one group commit per shard for all of them."
+  @doc """
+  Send the plans' forwards out (`Outbound.deliver/1`), except those a previous run
+  already sent (their key is in `deliveries`). Returns the plans with the sent forwards
+  marked `sent`, for `store/1` to record. Raises
+  `Outbound.Error` or a database error: nothing is stored then, and running it again
+  is the retry. With outbound off, forwards are counted as dropped and left unmarked.
+  """
+  def forward(plans) do
+    forwards = for {:ok, plan} <- plans, f <- plan.external, do: f
+
+    cond do
+      forwards == [] ->
+        plans
+
+      not Outbound.enabled?() ->
+        Outbound.dropped(forwards)
+        plans
+
+      true ->
+        sent =
+          Mailbox.delivered_keys(for f <- forwards, f.key, do: {f.tenant_id, f.account_id, f.key})
+
+        forwards
+        |> Enum.reject(&(&1.key && MapSet.member?(sent, {&1.account_id, &1.key})))
+        # The same record twice in one batch: one forward.
+        |> Enum.uniq_by(&((&1.key && {&1.account_id, &1.key}) || make_ref()))
+        |> Outbound.deliver()
+
+        Enum.map(plans, fn
+          {:ok, plan} ->
+            {:ok, %{plan | external: Enum.map(plan.external, &Map.put(&1, :sent, true))}}
+
+          error ->
+            error
+        end)
+    end
+  end
+
+  @doc """
+  Store planned deliveries: one group commit per shard for all of them, with the keys
+  of the forwards `forward/1` sent.
+  """
   def store(plans) do
-    items = for {:ok, plan} <- plans, item <- plan.items, do: item
+    plans =
+      Enum.map(plans, fn
+        {:ok, plan} -> {:ok, Map.put(plan, :marks, marks(plan))}
+        error -> error
+      end)
+
+    items = for {:ok, plan} <- plans, item <- plan.items ++ plan.marks, do: item
     {:ok, results} = if items == [], do: {:ok, []}, else: Mailbox.deliver(items)
 
     {outcomes, []} =
       Enum.map_reduce(plans, results, fn
         {:ok, plan}, results ->
-          {mine, rest} = Enum.split(results, length(plan.items))
+          {mine, rest} = Enum.split(results, length(plan.items) + length(plan.marks))
+          mine = Enum.take(mine, length(plan.items))
           discarded = if plan.discarded, do: [{:discarded, plan.account_id}], else: []
-          {{:ok, mine ++ discarded ++ Enum.map(plan.external, &{:external, &1})}, rest}
+          {{:ok, mine ++ discarded ++ Enum.map(plan.external, &{:external, &1.target})}, rest}
 
         {:error, _} = error, results ->
           {error, results}
@@ -155,6 +209,27 @@ defmodule Mailstore.Delivery do
 
   defp item(account_id, tenant_id, msg, entry),
     do: %{account_id: account_id, tenant_id: tenant_id, msg: msg, key: entry[:key]}
+
+  defp forward(account, address, bytes, entry, class) do
+    Outbound.new(%{
+      account_id: account.id,
+      tenant_id: account.tenant_id,
+      delivery_key: entry[:key],
+      rcpt: entry.rcpt,
+      target: address,
+      sender: entry[:sender],
+      raw: bytes,
+      class: class,
+      received_at: entry[:internal_date]
+    })
+  end
+
+  # Sent forwards, recorded like deliveries to the source account.
+  defp marks(plan) do
+    for %{sent: true, key: key} = f <- plan.external,
+        key != nil,
+        do: %{account_id: f.account_id, tenant_id: f.tenant_id, key: key, mark: true}
+  end
 
   defp emit_matched([]), do: :ok
 

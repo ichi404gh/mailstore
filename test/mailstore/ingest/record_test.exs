@@ -30,6 +30,19 @@ defmodule Mailstore.Ingest.RecordTest do
     assert byte_size(r.key) == 16
   end
 
+  test "envelope sender, and 8-bit bytes written as Latin-1 come back as they were" do
+    raw = "Subject: caf\xE9\r\n\r\n\xD0\x9F\r\n"
+    latin1 = :unicode.characters_to_binary(raw, :latin1, :utf8)
+    assert {:ok, r} = Record.parse(record(%{"envelope_content" => latin1}))
+    assert r.raw == raw
+    assert r.sender == "a@example.org"
+    assert {:ok, %{sender: nil}} = Record.parse(record(%{"sender_email" => nil}))
+
+    # Not Latin-1 (a character above U+00FF): taken as UTF-8.
+    assert {:ok, %{raw: "Subject: Привет\r\n\r\nx"}} =
+             Record.parse(record(%{"envelope_content" => "Subject: Привет\r\n\r\nx"}))
+  end
+
   test "class from the flags" do
     assert {:ok, %{class: :warmup}} = Record.parse(record(%{"is_warmup" => true}))
 

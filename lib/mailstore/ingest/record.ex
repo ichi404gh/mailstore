@@ -5,8 +5,13 @@ defmodule Mailstore.Ingest.Record do
 
   Fields:
 
-    * `envelope_content` - the message as received (RFC 5322, with `Received:` headers);
+    * `envelope_content` - the message as received (RFC 5322, with `Received:` headers),
+      its bytes decoded as Latin-1 (one byte, one character: the SMTP layer writes
+      `content.decode("latin-1")`), so 8-bit messages come back byte for byte. A string
+      with characters above U+00FF cannot be that; it is taken as UTF-8 text;
     * `rcp_email` - the recipient;
+    * `sender_email` - the envelope sender (MAIL FROM; empty for a bounce), the sender
+      of forwards to external targets;
     * `message_received_ts` - when SMTP accepted it (ISO 8601), becomes INTERNALDATE;
     * `is_spamtest`, `is_warmup` - the class, as classified upstream.
 
@@ -19,23 +24,25 @@ defmodule Mailstore.Ingest.Record do
   stored twice, as any mail server would.
   """
   @enforce_keys [:rcpt, :raw, :class, :key]
-  defstruct [:rcpt, :raw, :class, :key, :received_at]
+  defstruct [:rcpt, :raw, :class, :key, :received_at, :sender]
 
   @type t :: %__MODULE__{
           rcpt: String.t(),
           raw: binary,
           class: atom,
           key: <<_::128>>,
-          received_at: DateTime.t() | nil
+          received_at: DateTime.t() | nil,
+          sender: String.t() | nil
         }
 
   @spec parse(binary) :: {:ok, t} | {:error, String.t()}
   def parse(json) do
     with {:ok, %{} = doc} <- decode(json),
-         {:ok, raw} <- fetch_string(doc, "envelope_content"),
+         {:ok, content} <- fetch_string(doc, "envelope_content"),
          {:ok, rcpt} <- fetch_string(doc, "rcp_email"),
          true <- String.contains?(rcpt, "@") || {:error, "rcp_email is not an address"} do
       rcpt = rcpt |> String.trim() |> String.downcase()
+      raw = bytes(content)
 
       {:ok,
        %__MODULE__{
@@ -43,7 +50,8 @@ defmodule Mailstore.Ingest.Record do
          raw: raw,
          class: class(doc),
          key: key(rcpt, raw),
-         received_at: timestamp(doc["message_received_ts"])
+         received_at: timestamp(doc["message_received_ts"]),
+         sender: sender(doc["sender_email"])
        }}
     end
   end
@@ -52,6 +60,16 @@ defmodule Mailstore.Ingest.Record do
     <<key::binary-16, _::binary>> = :crypto.hash(:sha256, [rcpt, 0, raw])
     key
   end
+
+  defp bytes(content) do
+    case :unicode.characters_to_binary(content, :utf8, :latin1) do
+      raw when is_binary(raw) -> raw
+      _ -> content
+    end
+  end
+
+  defp sender(value) when is_binary(value), do: String.trim(value)
+  defp sender(_), do: nil
 
   defp decode(json) do
     case Jason.decode(json) do

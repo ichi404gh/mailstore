@@ -83,9 +83,12 @@ defmodule Mailstore.Mailbox do
   `items`: `%{account_id, tenant_id, msg}` plus optional `folder` (default "INBOX")
   and `key` (binary): an item whose key was already delivered to that account is
   reported as `:duplicate` and not stored again, so a batch can be replayed safely.
+  `%{account_id, tenant_id, key, mark: true}` only records the key (a published
+  forward, see `Mailstore.Outbound`).
 
   Returns `{:ok, results}`, one per item in order: `{:stored, account_id, folder, uid}`,
-  `{:duplicate, account_id}` or `{:failed, account_id, reason}`. Database errors raise:
+  `{:duplicate, account_id}`, `{:marked, account_id}` or `{:failed, account_id,
+  reason}`. Database errors raise:
   nothing of the shard's part of the batch was stored then.
   """
   def deliver(items) do
@@ -168,6 +171,7 @@ defmodule Mailstore.Mailbox do
 
   defp result(item, {:stored, _folder_id, uid}), do: {:stored, item.account_id, item.folder, uid}
   defp result(item, :duplicate), do: {:duplicate, item.account_id}
+  defp result(item, :marked), do: {:marked, item.account_id}
   defp result(item, {:failed, reason}), do: {:failed, item.account_id, reason}
 
   @doc "op: :add | :remove | :replace. Returns {:ok, [%{uid, flags, modseq}]}."
@@ -192,6 +196,35 @@ defmodule Mailstore.Mailbox do
   defdelegate move(account_id, from, uids, to), to: AccountServer
 
   ## Reads (straight from the shard)
+
+  @doc """
+  Which of `[{tenant_id, account_id, key}]` are recorded in `deliveries`: a MapSet of
+  `{account_id, key}`. One query per shard.
+  """
+  def delivered_keys([]), do: MapSet.new()
+
+  def delivered_keys(triples) do
+    triples
+    |> Enum.group_by(fn {tenant_id, _, _} -> Shards.repo(tenant_id) end, fn {_, a, k} ->
+      {a, k}
+    end)
+    |> Enum.flat_map(fn {repo, pairs} ->
+      {accounts, keys} = Enum.unzip(pairs)
+
+      %{rows: rows} =
+        repo.query!(
+          """
+          SELECT DISTINCT d.account_id, d.key
+          FROM deliveries d JOIN unnest($1::bigint[], $2::bytea[]) AS v(a, k)
+            ON d.account_id = v.a AND d.key = v.k
+          """,
+          [accounts, keys]
+        )
+
+      Enum.map(rows, fn [a, k] -> {a, k} end)
+    end)
+    |> MapSet.new()
+  end
 
   def list_folders(tenant_id, account_id),
     do: run(tenant_id, :all, Queries.folders_of_account(account_id))

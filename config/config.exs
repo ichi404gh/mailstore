@@ -79,6 +79,20 @@ config :mailstore, :ingest,
   batch_timeout: 200,
   batchers: 2
 
+# Outbound: forwards to external targets (see Mailstore.Outbound). Off by default.
+# Adapter Mailstore.Outbound.Kafka writes them to the relay sender's topic; the
+# MAILSTORE_OUTBOUND_KAFKA_* variables turn it on (config/runtime.exs). `relay` is the
+# relay sender's name for the SMTP relay to send through (its `server_name`); the
+# topic's max.message.bytes must allow `max_record_bytes`.
+config :mailstore, :outbound,
+  enabled: false,
+  adapter: Mailstore.Outbound.Kafka,
+  hosts: [localhost: 9092],
+  topic: "mailstore.outbound",
+  relay: nil,
+  max_record_bytes: 16 * 1024 * 1024,
+  ack_timeout: 30_000
+
 # How long delivered keys are remembered (dedup of replays). Must exceed the retention
 # of anything ingest can replay from: the source topics and the dead-letter topic.
 config :mailstore, :delivery_dedup_days, 8

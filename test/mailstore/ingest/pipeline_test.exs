@@ -2,8 +2,9 @@ defmodule Mailstore.Ingest.PipelineTest do
   use Mailstore.DataCase, async: false
   # Dead letters are logged.
   @moduletag :capture_log
-  alias Mailstore.Mailbox
+  alias Mailstore.{Directory, Mailbox}
   alias Mailstore.Ingest.{Pipeline, RecordTest}
+  alias Mailstore.Outbound.TestAdapter
 
   setup do
     tenant = tenant_fixture()
@@ -65,6 +66,28 @@ defmodule Mailstore.Ingest.PipelineTest do
     assert length(ok) == 3
     assert %{stored: 0, duplicate: 2, unknown: 1} = counts
     assert {:ok, %{messages_count: 2, uidnext: 3}} = Mailbox.status(bob.id, "INBOX")
+  end
+
+  test "forwards go out before the ack, through a topic outage, and once",
+       %{bob: bob, name: name} do
+    TestAdapter.listen()
+    on_exit(fn -> Application.delete_env(:mailstore, :outbound_test) end)
+    {:ok, _} = Directory.create_forwarding(bob, "crm@partner.example")
+
+    record =
+      RecordTest.record(%{
+        "envelope_content" => raw(20),
+        "rcp_email" => "bob@acme.test",
+        "sender_email" => "a@example.org"
+      })
+
+    TestAdapter.fail_next(2)
+    {[_], [], %{stored: 1, external: 1}} = run(name, [record])
+    assert_received {:outbound, [%{sender: "a@example.org", target: "crm@partner.example"}]}
+
+    # Replayed (a restart before the offset commit): neither stored nor sent again.
+    {[_], [], %{duplicate: 1, external: 1}} = run(name, [record])
+    refute_received {:outbound, _}
   end
 
   test "class and internal date come from the record", %{bob: bob, name: name} do

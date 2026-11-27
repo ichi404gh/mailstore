@@ -40,7 +40,7 @@ flowchart LR
   end
 
   obj[("Объектное хранилище, API S3<br/>pack-файлы тел закрытых недель")]
-  relay[("Kafka: топик relay-sender<br/>внешние пересылки")]:::planned
+  relay[("Kafka: топик relay-sender<br/>внешние пересылки")]
 
   clients -->|IMAPS| hap
   hap -->|"PROXY v2 + IMAP"| compute
@@ -49,7 +49,7 @@ flowchart LR
   dir -->|"зеркало в ETS на каждой ноде"| compute
   compute -->|"шард по tenant"| storage
   compute -->|"загрузка pack-файлов,<br/>Range GET"| obj
-  compute -.->|"копии на внешние адреса"| relay
+  compute -->|"Outbound.Kafka: копии<br/>на внешние адреса"| relay
 
   classDef planned stroke-dasharray: 5 5
 ```
@@ -96,6 +96,8 @@ flowchart TB
   ms --> pm["PartitionMaintainer<br/>раз в 12 ч: партиции вперёд,<br/>дни deliveries, удаление по сроку,<br/>холодный слой"]
   ms --> place["Placement<br/>нода-владелец ящика,<br/>передача при смене состава"]
 
+  app --> outb["Outbound<br/>(если включён)"]
+  outb --> ob["адаптер Outbound.Kafka:<br/>brod-клиент топика relay-sender"]
   app --> ing["Ingest<br/>(если включён)"]
   ing --> dl["brod-клиент<br/>dead-letter топика"]
   ing --> pipe["Pipeline (Broadway):<br/>4 продюсера, процессоры,<br/>2 батчера"]
@@ -129,6 +131,7 @@ flowchart LR
   mailbox["Mailbox<br/>папки и письма,<br/>актор аккаунта"]
   shards["Shards<br/>tenant → repo шарда,<br/>реестр, перенос tenant"]
   coldstore["ColdStore<br/>объектное хранилище:<br/>S3 API или каталог"]
+  outbound["Outbound<br/>внешние пересылки;<br/>адаптер Kafka: топик relay-sender"]
   core["Core<br/>чистые функции: заголовки,<br/>флаги, классы, zstd"]
   telemetry["Telemetry"]
   repo[("Справочник<br/>(Repo)")]
@@ -138,7 +141,8 @@ flowchart LR
   imap -->|"subscribe, append, store,<br/>fetch, search"| mailbox
   imap -->|"span на команду"| telemetry
   delivery -->|"lookup_account,<br/>forwardings_for, rules_for"| directory
-  ingest -->|deliver_many| delivery
+  ingest -->|"plan, forward, store"| delivery
+  delivery -->|"deliver<br/>(внешние пересылки)"| outbound
   delivery -->|"deliver<br/>(групповая запись)"| mailbox
   mailbox -->|"repo(tenant)"| shards
   mailbox -->|"pack-файлы, Range GET<br/>(Mailbox.Cold)"| coldstore
@@ -153,7 +157,7 @@ flowchart LR
 
 ## 4. Доставка письма
 
-Записи из Kafka разбирают процессоры Broadway, параллельно: JSON, заголовки, ENVELOPE и дерево MIME-частей (`Core.NewMessage`), правила доставки вместо sieve (`Core.Rules`: теги warmup, удаление, отказы, исключения из пересылки), сжатие тела. Затем применяются правила пересылки: копия в мастер-инбокс (с фильтром по классу, чтобы warmup туда не попадал), redirect без сохранения оригинала или внешняя пересылка. Пачка до 200 записей (или за 200 мс) пишется одной транзакцией на шард, мимо акторов. Повтор пачки безопасен: ключ доставки (хеш получателя и байтов письма) записывается в `deliveries` в той же транзакции, и уже доставленное не пишется второй раз. Офсеты коммитятся в Kafka раз в несколько секунд. После коммита запущенные акторы получателей узнают, что пришло, и рассылают EXISTS своим сессиям.
+Записи из Kafka разбирают процессоры Broadway, параллельно: JSON, заголовки, ENVELOPE и дерево MIME-частей (`Core.NewMessage`), правила доставки вместо sieve (`Core.Rules`: теги warmup, удаление, отказы, исключения из пересылки), сжатие тела. Затем применяются правила пересылки: копия в мастер-инбокс (с фильтром по классу, чтобы warmup туда не попадал), redirect без сохранения оригинала или внешняя пересылка. Внешние пересылки пачки отдаются `Outbound` (адаптер `Outbound.Kafka` пишет их в топик relay-sender) до записи в базу, кроме уже отправленных (их ключи есть в `deliveries`); их ключи записываются в транзакции пачки. Пачка до 200 записей (или за 200 мс) пишется одной транзакцией на шард, мимо акторов. Повтор пачки безопасен: ключ доставки (хеш получателя и байтов письма) записывается в `deliveries` в той же транзакции, и уже доставленное не пишется второй раз. Офсеты коммитятся в Kafka раз в несколько секунд. После коммита запущенные акторы получателей узнают, что пришло, и рассылают EXISTS своим сессиям.
 
 ```mermaid
 sequenceDiagram
@@ -165,13 +169,18 @@ sequenceDiagram
   participant PG as Шард Postgres
   participant A as AccountServer<br/>(если запущен)
   participant C as Connection<br/>(сессия в IDLE)
+  participant R as Kafka: топик<br/>relay-sender
 
   K->>P: записи (JSON)
   P->>DC: lookup_account, forwardings_for, rules_for
   P->>P: Record.parse, NewMessage.from_raw,<br/>правила доставки (Core.Rules), zstd
   P->>B: пачка до 200 записей или за 200 мс
+  opt есть внешние пересылки
+    B->>PG: SELECT deliveries (уже отправленные)
+    B->>R: записи пересылок, ждём подтверждения всех
+  end
   B->>PG: BEGIN
-  B->>PG: INSERT deliveries ... ON CONFLICT DO NOTHING<br/>(уже доставленные отсеиваются)
+  B->>PG: INSERT deliveries ... ON CONFLICT DO NOTHING<br/>(уже доставленные отсеиваются; ключи пересылок)
   B->>PG: SELECT folders ... ORDER BY id FOR UPDATE
   B->>PG: UPDATE folders: uidnext, счётчики (одним запросом)
   B->>PG: INSERT messages, message_bodies (всей пачкой,<br/>партиция — политика хранения класса и неделя)

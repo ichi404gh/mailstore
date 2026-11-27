@@ -35,3 +35,10 @@ config :mailstore, :cold_store,
   adapter: Mailstore.ColdStore.Local,
   root: Path.join(System.tmp_dir!(), "mailstore-cold-test"),
   pack_bytes: 64 * 1024
+
+# Forwards go to the test process (test/support/outbound_test_adapter.ex).
+config :mailstore, :outbound,
+  enabled: true,
+  adapter: Mailstore.Outbound.TestAdapter,
+  relay: "test-relay",
+  topic: "mailstore.outbound"

@@ -70,6 +70,7 @@ defmodule Mailstore.Mailbox.Commands do
   as stored and `key` a binary that identifies the delivery (or nil). A key already in
   `deliveries` for that account (also earlier in the same batch) makes the item a
   duplicate: nothing is stored and no UID is spent, so replaying a batch is harmless.
+  An item with `mark: true` (and no message) only records its key: `:marked`.
 
   Folder rows are locked in id order before UIDs are allocated (concurrent batches
   touching the same folders cannot deadlock each other), and stay locked until commit:
@@ -77,13 +78,16 @@ defmodule Mailstore.Mailbox.Commands do
   relies on (`AccountServer.delivered/2`).
 
   Returns `{results, updates}`: one result per item, in order (`{:stored, folder_id,
-  uid}`, `:duplicate` or `{:failed, :no_such_folder}`), and one update per folder that
+  uid}`, `:duplicate`, `:marked` or `{:failed, :no_such_folder}`), and one update per folder that
   got messages: `%{account_id, folder_id, uids, unseen, keywords, counters}`.
   """
   def deliver(repo, items, opts \\ []) do
     stored_at = Keyword.get(opts, :stored_at, DateTime.utc_now())
     items = Enum.with_index(items)
     {keep, duplicates} = dedup(repo, items)
+    mark? = fn {item, _i} -> Map.get(item, :mark, false) end
+    marks = Enum.filter(keep ++ duplicates, mark?)
+    {keep, duplicates} = {Enum.reject(keep, mark?), Enum.reject(duplicates, mark?)}
     folders = lock_folders(repo, keep)
 
     {placed, missing} =
@@ -141,6 +145,7 @@ defmodule Mailstore.Mailbox.Commands do
     results =
       (Enum.map(placed, &{&1.index, {:stored, &1.folder_id, &1.uid}}) ++
          Enum.map(duplicates, fn {_item, i} -> {i, :duplicate} end) ++
+         Enum.map(marks, fn {_item, i} -> {i, :marked} end) ++
          Enum.map(missing, fn {_item, i} -> {i, {:failed, :no_such_folder}} end))
       |> Enum.sort_by(&elem(&1, 0))
       |> Enum.map(&elem(&1, 1))

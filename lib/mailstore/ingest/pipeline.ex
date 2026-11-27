@@ -2,6 +2,11 @@ defmodule Mailstore.Ingest.Pipeline do
   @moduledoc """
   Consumer of the inbound topics: Kafka -> `Ingest.Record` -> `Delivery.deliver_many/1`.
 
+  * Forwards to external targets are sent out (`Delivery.forward/1`, for now as records
+    of the relay sender's topic) before the batch is stored, and the batch is acked
+    only after both: a crash anywhere replays it, and its sent forwards are recognized
+    by their keys.
+
   * Processors parse records and do the CPU work in parallel (`Delivery.plan/1`):
     recipient lookup, delivery rules, MIME structure, envelope, zstd. A record that
     cannot be parsed fails and goes to the dead-letter topic (`handle_failed/2`).
@@ -10,12 +15,15 @@ defmodule Mailstore.Ingest.Pipeline do
   * Offsets are committed after the batch, periodically (BroadwayKafka). Writing is
     idempotent (delivery key, see `Ingest.Record`), so anything replayed after a crash
     or a rebalance is recognized and not stored twice; offsets can be committed late.
-  * The database being down is not a reason to skip mail: the batch is retried with
-    backoff until it goes through, and the pipeline stops pulling meanwhile.
+  * The database or the outbound transport being down is not a reason to skip mail:
+    the step is retried with backoff until it goes through, and the pipeline stops
+    pulling meanwhile. Forwards sent before a database outage are not sent again by
+    the retry.
     Any other error is isolated to its message: the batch is retried one message at a
     time and only the messages that still fail go to the dead-letter topic.
 
-  Emits `[:mailstore, :ingest, :batch]` with counts of what happened to the batch, its
+  Emits `[:mailstore, :ingest, :batch]` with counts of what happened to the batch
+  (`external`: forwards to external targets, sent or, with outbound off, dropped), its
   duration and `lag_ms` (now minus the Kafka timestamp of its oldest record).
   """
   use Broadway
@@ -85,7 +93,8 @@ defmodule Mailstore.Ingest.Pipeline do
             raw: r.raw,
             class: r.class,
             internal_date: r.received_at,
-            key: r.key
+            key: r.key,
+            sender: r.sender
           })
 
         # BroadwayKafka batches per topic partition, to keep its order. Records are
@@ -149,22 +158,33 @@ defmodule Mailstore.Ingest.Pipeline do
     messages
   end
 
-  # Group commit; waits out database outages (nothing is acked meanwhile).
-  defp deliver(messages, backoff \\ 100) do
-    messages |> Enum.map(& &1.data) |> Delivery.store()
+  # Forwards, then the group commit; each step waits out outages of what it needs
+  # (nothing is acked meanwhile).
+  defp deliver(messages) do
+    messages
+    |> Enum.map(& &1.data)
+    |> retrying(&Delivery.forward/1)
+    |> retrying(&Delivery.store/1)
+  end
+
+  defp retrying(arg, fun, backoff \\ 100) do
+    fun.(arg)
   rescue
     e ->
       if transient?(e) do
         Logger.warning(
-          "ingest: database unavailable, retrying in #{backoff} ms: #{Exception.message(e)}"
+          "ingest: #{unavailable(e)}, retrying in #{backoff} ms: #{Exception.message(e)}"
         )
 
         Process.sleep(backoff)
-        deliver(messages, min(backoff * 2, 5_000))
+        retrying(arg, fun, min(backoff * 2, 5_000))
       else
         reraise e, __STACKTRACE__
       end
   end
+
+  defp unavailable(%Mailstore.Outbound.Error{}), do: "outbound unavailable"
+  defp unavailable(_), do: "database unavailable"
 
   # Something in the batch breaks the group commit: find it. Each message alone is
   # still a transaction of its own, and still idempotent.
@@ -181,6 +201,7 @@ defmodule Mailstore.Ingest.Pipeline do
     end)
   end
 
+  defp transient?(%Mailstore.Outbound.Error{transient: transient}), do: transient
   defp transient?(%DBConnection.ConnectionError{}), do: true
 
   defp transient?(%Postgrex.Error{postgres: %{code: code}}),
@@ -190,7 +211,15 @@ defmodule Mailstore.Ingest.Pipeline do
   defp transient?(_), do: false
 
   defp count(results) do
-    zero = %{messages: 0, stored: 0, duplicate: 0, discarded: 0, unknown: 0, failed: 0}
+    zero = %{
+      messages: 0,
+      stored: 0,
+      duplicate: 0,
+      discarded: 0,
+      external: 0,
+      unknown: 0,
+      failed: 0
+    }
 
     Enum.reduce(results, zero, fn
       result, acc ->
@@ -203,7 +232,7 @@ defmodule Mailstore.Ingest.Pipeline do
               {:duplicate, _}, a -> Map.update!(a, :duplicate, &(&1 + 1))
               {:discarded, _}, a -> Map.update!(a, :discarded, &(&1 + 1))
               {:failed, _, _}, a -> Map.update!(a, :failed, &(&1 + 1))
-              {:external, _}, a -> a
+              {:external, _}, a -> Map.update!(a, :external, &(&1 + 1))
             end)
 
           {:error, :unknown_recipient} ->
