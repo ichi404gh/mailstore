@@ -163,9 +163,9 @@ defmodule Mailstore.Mailbox.Commands do
           uniq: true,
           do: {item.account_id, key}
 
-    recorded =
+    rows =
       if keyed == [] do
-        MapSet.new()
+        []
       else
         {accounts, keys} = keyed |> Enum.sort() |> Enum.unzip()
 
@@ -181,8 +181,12 @@ defmodule Mailstore.Mailbox.Commands do
             [accounts, keys]
           )
 
-        MapSet.new(rows, fn [a, k] -> {a, k} end)
+        rows
       end
+
+    # One MapSet constructor: a MapSet built in two branches makes Dialyzer (OTP 28+)
+    # merge them into a non-opaque type and reject MapSet.member?/2.
+    recorded = MapSet.new(rows, fn [a, k] -> {a, k} end)
 
     {keep, dups, _taken} =
       Enum.reduce(items, {[], [], MapSet.new()}, fn {item, _i} = entry, {keep, dups, taken} ->
